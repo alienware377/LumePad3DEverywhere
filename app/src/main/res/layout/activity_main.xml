@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/app_name"
+            android:textColor="@color/white"
+            android:textSize="26sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="Real-time 2D→3D for the Lume Pad 2 lightfield display"
+            android:textColor="#A0A6B4"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:background="#1A1D27"
+            android:padding="12dp"
+            android:text="Idle."
+            android:textColor="#D8DCE6"
+            android:textSize="14sp"
+            android:fontFamily="monospace" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="1 · Permissions"
+            android:textColor="@color/brand"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/btnOverlayPerm"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Grant overlay permission" />
+
+        <Button
+            android:id="@+id/btnUsagePerm"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Grant usage access (foreground detection)" />
+
+        <Button
+            android:id="@+id/btnCameraPerm"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Grant camera (eye tracking)" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="2 · Target app"
+            android:textColor="@color/brand"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/btnPickApp"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Choose app to make 3D…" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="3 · 3D strength"
+            android:textColor="@color/brand"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/depthLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Depth (pop-out): 50%"
+            android:textColor="#D8DCE6" />
+
+        <SeekBar
+            android:id="@+id/depthSeek"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="50" />
+
+        <TextView
+            android:id="@+id/convLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Convergence (screen plane): 50%"
+            android:textColor="#D8DCE6" />
+
+        <SeekBar
+            android:id="@+id/convSeek"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="50" />
+
+        <Switch
+            android:id="@+id/swapSwitch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Swap eyes (fix backwards/inside-out 3D)"
+            android:textColor="#D8DCE6" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="4 · Run"
+            android:textColor="@color/brand"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/btnStart"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:backgroundTint="@color/brand"
+            android:text="Start 3D" />
+
+        <Button
+            android:id="@+id/btnStop"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:enabled="false"
+            android:text="Stop" />
+
+    </LinearLayout>
+</ScrollView>

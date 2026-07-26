@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+
+    <!-- Fullscreen 3D overlay drawn over the target app. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Continuous screen capture of the chosen app. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <!-- Detect which app is in the foreground (per-app gating). User-granted in Settings. -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- Foreground-service notification on Android 13+. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Required by CNSDK: front camera for face tracking + network for its services. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- CNSDK queries the on-device Leia services; Shizuku manager app. -->
+    <queries>
+        <package android:name="com.leia.headtrackingservice" />
+        <package android:name="com.leialoft.display.config" />
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Lume3D"
+        tools:targetApi="34">
+
+        <!-- Grant the QNN HTP stub access to the Hexagon DSP RPC vendor lib so it can
+             reach the NPU (it's a vendor public library on this device). -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".Capture3DService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- Shizuku binder provider (required by the Shizuku API). -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
+            tools:ignore="ExportedContentProvider" />
+
+    </application>
+</manifest>

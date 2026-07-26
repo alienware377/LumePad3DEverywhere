@@ -1,0 +1,19 @@
+# Build outputs
+/app/build/
+/build/
+.gradle/
+.kotlin/
+
+# Local machine config
+local.properties
+
+# Session/debug artifacts
+/backups/
+/_da/
+/_vidframes/
+/logcat.txt
+/*.png
+/*.xml
+
+# Large unused model (MiDaS w8a8 is the active one)
+/app/src/main/assets/depth_anything_v2.tflite
