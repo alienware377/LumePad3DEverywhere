@@ -17,3 +17,6 @@ local.properties
 
 # Large unused model (MiDaS w8a8 is the active one)
 /app/src/main/assets/depth_anything_v2.tflite
+
+# Scratch: extracted CNSDK AAR (jar/native libs) used for API spelunking
+/_tmp_cnsdk/

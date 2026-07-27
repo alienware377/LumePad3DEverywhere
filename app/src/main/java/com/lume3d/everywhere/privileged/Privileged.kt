@@ -274,6 +274,34 @@ object Privileged {
         runShell(arrayOf("input", "-d", displayId.toString(), "keyevent", keyCode.toString())) == 0
     } catch (t: Throwable) { Log.e(TAG, "injectKey failed: ${t.message}"); false }
 
+    /**
+     * Disable Android 12's untrusted-touch blocking (user-consented). Our fullscreen 3D overlay
+     * is opaque, so touches released to other overlay apps (Pie Control etc.) below us are
+     * otherwise flagged obscured and silently dropped by those apps / the input dispatcher.
+     *  - maximum_obscuring_opacity_for_touch = 1.0: an opaque overlay's opacity (1.0) is not
+     *    strictly greater than the threshold, so it no longer marks touches untrusted.
+     *  - block_untrusted_touches_mode = 0 (DeviceConfig): disables the block feature outright.
+     * Both are shell-scoped and applied live via the InputManager settings/DeviceConfig observers.
+     */
+    fun allowTouchThroughOverlay(): Boolean = try {
+        val a = runShell(arrayOf("settings", "put", "global",
+            "maximum_obscuring_opacity_for_touch", "1.0"))
+        val b = runShell(arrayOf("device_config", "put", "input_native_boot",
+            "block_untrusted_touches_mode", "0"))
+        Log.i(TAG, "allowTouchThroughOverlay rc=($a,$b)")
+        a == 0
+    } catch (t: Throwable) { Log.e(TAG, "allowTouchThroughOverlay failed: ${t.message}"); false }
+
+    /** Restore Android's default untrusted-touch blocking (undo [allowTouchThroughOverlay]). */
+    fun restoreTouchBlock(): Boolean = try {
+        val a = runShell(arrayOf("settings", "delete", "global",
+            "maximum_obscuring_opacity_for_touch"))
+        val b = runShell(arrayOf("device_config", "delete", "input_native_boot",
+            "block_untrusted_touches_mode"))
+        Log.i(TAG, "restoreTouchBlock rc=($a,$b)")
+        a == 0
+    } catch (t: Throwable) { Log.e(TAG, "restoreTouchBlock failed: ${t.message}"); false }
+
     // ---- shell process helpers (via Shizuku) ----
 
     private fun runShell(cmd: Array<String>): Int {

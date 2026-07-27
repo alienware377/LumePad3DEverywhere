@@ -68,6 +68,10 @@ class Capture3DService : Service() {
         if (!Privileged.isShizukuReady()) {
             Log.e(TAG, "Shizuku not ready"); stopSelf(); return START_NOT_STICKY
         }
+        // User-consented touch-block mod: let touches released by our pass-through reach other
+        // overlay apps (Android 12 otherwise flags them untrusted through our opaque overlay).
+        if (applicationContext.touchBlockDisabled) Privileged.allowTouchThroughOverlay()
+        else Privileged.restoreTouchBlock()
         targetPkg = applicationContext.targetPackage
         if (targetPkg == null) { Log.e(TAG, "no target package"); stopSelf(); return START_NOT_STICKY }
 
@@ -183,7 +187,7 @@ class Capture3DService : Service() {
         // Not secure (we capture the virtual display, not the panel) and touchable so we
         // can forward gestures to the app running offscreen.
         overlay = OverlayController(
-            this, captureW * 2, captureH,
+            this, captureW * StereoRenderer.NUM_VIEWS, captureH,
             secure = false, touchable = true, onTouch = ::forwardTouch,
         ) { st ->
             val rnd = StereoRenderer(this, st, captureW, captureH)
@@ -264,6 +268,22 @@ class Capture3DService : Service() {
 
     /** Re-apply slider values to the live renderer (called from the UI). */
     fun refreshParams() { renderer?.let { applyParams(it) } }
+
+    /** Full touch pass-through: let other overlay apps receive all touches. */
+    fun setPassThrough(on: Boolean) { overlay?.setPassThrough(on) }
+    fun isPassThrough(): Boolean = overlay?.isPassThrough() ?: false
+    /** Edge pass-through margin in px. */
+    fun setEdgeMargin(px: Int) { overlay?.setEdgeMargin(px) }
+    /** Toggle the OS untrusted-touch block mod (applies immediately via Shizuku). */
+    fun setTouchBlockDisabled(on: Boolean) {
+        applicationContext.touchBlockDisabled = on
+        Thread { if (on) Privileged.allowTouchThroughOverlay() else Privileged.restoreTouchBlock() }.start()
+    }
+    /** Toggle the dim-to-pass-through approach (re-applies overlay opacity live). */
+    fun setDimForPassThrough(on: Boolean) {
+        applicationContext.dimForPassThrough = on
+        overlay?.updateOverlayDim()
+    }
 
     /** Show/hide the 3D overlay surface. The captured app keeps running on the virtual
      *  display either way; Hide just reveals whatever is on display 0 (typically the
@@ -372,6 +392,26 @@ class Capture3DService : Service() {
         rnd.baseline = 0.004f + depth * 0.026f     // 0.004..0.03 UV; kept small to avoid ghosting/double-vision
         rnd.convergence = conv
         rnd.swapLr = if (applicationContext.swapLeftRight) 1f else 0f
+        // Slider 0..200% -> crosstalk coefficient 0..0.50 (100% = 0.25; LP2 lenticular
+        // leak between adjacent views can be well above 30%)
+        rnd.ghost = (applicationContext.actStrength / 200f) * 0.50f
+        rnd.ghost2Lo = (applicationContext.ghost2Strength / 200f) * 0.50f
+        rnd.ghost2Hi = (applicationContext.ghost2HiStrength / 200f) * 0.50f
+        rnd.ghost2Cross = applicationContext.ghost2CrossPct / 100f
+        rnd.ghostDesat = applicationContext.ghostDesatStrength / 200f
+        rnd.softKnee = if (applicationContext.softKneeOn) applicationContext.softKneeStrength / 100f else 0f
+        rnd.softKneeThresh = applicationContext.softKneeThreshPct / 100f
+        rnd.ghostMask = if (applicationContext.ghostMaskOn) applicationContext.ghostMaskStrength / 100f else 0f
+        rnd.depthSharp = if (applicationContext.depthSharpOn) applicationContext.depthSharpStrength / 100f else 0f
+        val f = FloatArray(18)
+        val master = applicationContext.filtersEnabled
+        for (i in 0 until 6) {
+            val on = master && applicationContext.filterOn(i)
+            f[i * 3] = if (on) (applicationContext.filterAmt(i) - 100) / 100f else 0f
+            f[i * 3 + 1] = applicationContext.filterLo(i) / 100f
+            f[i * 3 + 2] = applicationContext.filterHi(i) / 100f
+        }
+        rnd.filters = f
     }
 
     private fun saveDebugFrame(src: java.nio.ByteBuffer, w: Int, h: Int, rowStride: Int) {
