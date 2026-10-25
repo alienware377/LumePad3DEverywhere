@@ -95,9 +95,18 @@ class OverlayController(
             })
             v.setViewAsset(a)
             // Touch is handled by a SEPARATE catcher window (see addTouchCatcher): the 3D
-            // view must stay fullscreen and pixel-exact for lenticular alignment, so it can't
-            // be inset for the edge pass-through, and it stays non-touchable itself.
+            // view must stay pixel-exact for lenticular alignment, and stays non-touchable itself.
             view = v
+            // Android lays this window out around the nav bar (2560x1520 with it showing, full
+            // height once it's hidden), so its frame tells us where the nav bar is right now.
+            // The catcher's own insets stayed zero on the LP2, so they can't be used for this.
+            v.addOnLayoutChangeListener { vv, l, t, r, b, _, _, _, _ ->
+                val loc = IntArray(2); vv.getLocationOnScreen(loc)
+                val sb = wm.maximumWindowMetrics.bounds
+                onNavInsets(android.graphics.Insets.of(loc[0], loc[1],
+                    (sb.width() - loc[0] - (r - l)).coerceAtLeast(0),
+                    (sb.height() - loc[1] - (b - t)).coerceAtLeast(0)))
+            }
             asset = a
             addOverlay(v)
         } catch (t: Throwable) {
@@ -106,8 +115,7 @@ class OverlayController(
     }
 
     private fun addOverlay(v: View) {
-        // The 3D view is pixels only; a separate catcher window forwards touch. Keeping the
-        // 3D window non-touchable also lets us drop the catcher entirely for full pass-through.
+        // The 3D view is pixels only; a separate catcher window forwards touch.
         var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
@@ -341,7 +349,6 @@ class OverlayController(
 
             val grip = mkBtn("⠿").apply { setTextColor(0xFF888888.toInt()) }
             val gear = mkBtn("⚙")
-            val kb = mkBtn("⌨")
             val close = mkBtn("✕")
 
             // Grip: double-tap or long-press to minimize
@@ -694,13 +701,12 @@ class OverlayController(
 
             gear.setOnClickListener {
                 ctrlPanel?.let { it.visibility = if (it.visibility == View.GONE) View.VISIBLE else View.GONE }
+                resized()
             }
-            kb.setOnClickListener { toggleKeyboard() }
             close.setOnClickListener { Capture3DService.stop(context) }
 
             bar.addView(grip)
             bar.addView(gear)
-            bar.addView(kb)
             bar.addView(close)
             root.addView(bar)
             root.dragHandle = bar   // drag from the button row only; the panel scrolls
@@ -719,7 +725,7 @@ class OverlayController(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
             settingsPanel.visibility = View.VISIBLE   // visibility now driven by the scroll wrapper
 
-            ctrlBtns = listOf(gear, kb, close)
+            ctrlBtns = listOf(gear, close)
             ctrlPanel = scroll
             tdPanelView = null
 
@@ -735,6 +741,10 @@ class OverlayController(
                 PixelFormat.TRANSLUCENT
             )
             lp.gravity = Gravity.TOP or Gravity.START
+            // Make x/y plain screen pixels. By default Android places an overlay inside the area
+            // below the status bar, which silently pushed the bar 66 px lower than DragLayout
+            // asked for (into the nav bar when snapped to the bottom).
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) lp.fitInsetsTypes = 0
             lp.x = dp(8); lp.y = dp(8)
             wm.addView(root, lp)
             tuneWin = root
@@ -831,6 +841,21 @@ class OverlayController(
         } catch (t: Throwable) { Log.w(TAG, "hidden api exemption failed: ${t.message}") }
     }
 
+    /** Where the nav bar is right now (screen px per side; zero while it's hidden). */
+    private var navInsets: android.graphics.Insets = try {
+        wm.currentWindowMetrics.windowInsets.getInsets(android.view.WindowInsets.Type.navigationBars())
+    } catch (_: Throwable) { android.graphics.Insets.NONE }
+
+    private var navKnown = false   // the first real reading always counts, even if it equals the guess
+
+    private fun onNavInsets(i: android.graphics.Insets) {
+        if (navKnown && i == navInsets) return
+        navKnown = true
+        navInsets = i
+        Log.i(TAG, "nav bar insets now $i")
+        (tuneWin as? DragLayout)?.let { it.post { it.reSnap() } }
+    }
+
     /**
      * A LinearLayout-backed overlay window the user can drag anywhere (from any part of it — child
      * buttons still receive taps via a touch-slop check) and that snaps to the nearest screen edge
@@ -843,18 +868,36 @@ class OverlayController(
         private var startX = 0
         private var startY = 0
         private var dragging = false
-        private var snapped = false
+        /** Which edge we're tucked against: one of the EDGE_ values, or EDGE_NONE while floating. */
+        private var snapEdge = EDGE_NONE
         private var downOnHandle = false
         /** Only gestures starting on this child may drag the window — panel touches
          *  (sliders, ScrollView) pass through untouched. Null = whole window drags. */
         var dragHandle: View? = null
 
+        init {
+            // Whenever the group grows or shrinks (panel, sections, minimize), keep it on screen and
+            // flush to its edge. Runs after layout, so the new size is already known.
+            addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+                if (r - l != or - ol || b - t != ob - ot) post { reSnap() }
+            }
+        }
+
         /** After the group grows/shrinks (minimize toggle), re-tuck flush to its edge if snapped. */
-        fun onContentResized() { if (snapped) post { snapToEdge() } }
+        fun onContentResized() { post { reSnap() } }
 
         private fun lp() = layoutParams as WindowManager.LayoutParams
         private fun screenW() = wm.maximumWindowMetrics.bounds.width()
         private fun screenH() = wm.maximumWindowMetrics.bounds.height()
+        // The usable area: the whole screen minus wherever the nav bar currently sits.
+        private fun minX() = navInsets.left
+        private fun minY() = maxOf(navInsets.top, statusBarTop())
+        /** Keep clear of the status bar too; it sits above us just like the nav bar does. */
+        private fun statusBarTop() = try {
+            wm.currentWindowMetrics.windowInsets.getInsets(android.view.WindowInsets.Type.statusBars()).top
+        } catch (_: Throwable) { 0 }
+        private fun maxX() = (screenW() - navInsets.right - width).coerceAtLeast(minX())
+        private fun maxY() = (screenH() - navInsets.bottom - height).coerceAtLeast(minY())
 
         override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
             when (ev.actionMasked) {
@@ -869,7 +912,7 @@ class OverlayController(
                     if (downOnHandle && !dragging &&
                         (kotlin.math.abs(ev.rawX - downRawX) > slop ||
                             kotlin.math.abs(ev.rawY - downRawY) > slop)) {
-                        dragging = true; snapped = false; return true   // steal the gesture from the buttons
+                        dragging = true; snapEdge = EDGE_NONE; return true   // steal the gesture from the buttons
                     }
                 }
             }
@@ -885,8 +928,8 @@ class OverlayController(
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val l = lp()
-                    l.x = (startX + (ev.rawX - downRawX)).toInt().coerceIn(0, (screenW() - width).coerceAtLeast(0))
-                    l.y = (startY + (ev.rawY - downRawY)).toInt().coerceIn(0, (screenH() - height).coerceAtLeast(0))
+                    l.x = (startX + (ev.rawX - downRawX)).toInt().coerceIn(minX(), maxX())
+                    l.y = (startY + (ev.rawY - downRawY)).toInt().coerceIn(minY(), maxY())
                     try { wm.updateViewLayout(this, l) } catch (_: Throwable) {}
                     return true
                 }
@@ -901,74 +944,41 @@ class OverlayController(
 
         private fun snapToEdge() {
             val l = lp()
-            val maxX = (screenW() - width).coerceAtLeast(0)
-            val maxY = (screenH() - height).coerceAtLeast(0)
-            val dl = l.x; val dr = maxX - l.x; val dt = l.y; val db = maxY - l.y
-            when (minOf(dl, dr, dt, db)) {
-                dl -> l.x = 0
-                dr -> l.x = maxX
-                dt -> l.y = 0
-                else -> l.y = maxY
+            val dl = l.x - minX(); val dr = maxX() - l.x; val dt = l.y - minY(); val db = maxY() - l.y
+            snapEdge = when (minOf(dl, dr, dt, db)) {
+                dl -> EDGE_LEFT
+                dr -> EDGE_RIGHT
+                dt -> EDGE_TOP
+                else -> EDGE_BOTTOM
             }
-            snapped = true
+            reSnap()
+        }
+
+        /**
+         * Put the group back flush against its edge (or, while floating, just back on screen),
+         * using the nav bar's current place: above it while it shows, down to the screen edge
+         * while it's hidden.
+         */
+        fun reSnap() {
+            if (!isAttachedToWindow) return
+            val l = lp()
+            val x = when (snapEdge) {
+                EDGE_LEFT -> minX()
+                EDGE_RIGHT -> maxX()
+                else -> l.x.coerceIn(minX(), maxX())
+            }
+            val y = when (snapEdge) {
+                EDGE_TOP -> minY()
+                EDGE_BOTTOM -> maxY()
+                else -> l.y.coerceIn(minY(), maxY())
+            }
+            if (x == l.x && y == l.y) return
+            l.x = x; l.y = y
             try { wm.updateViewLayout(this, l) } catch (_: Throwable) {}
         }
     }
 
     private val kbHandler = android.os.Handler(android.os.Looper.getMainLooper())
-
-    /**
-     * ⌨ button: close the keyboard if it is up, otherwise open it. The IME is bound to the
-     * captured app's field on the virtual display, which our app can't see, so ask the system
-     * (`dumpsys input_method` via Shizuku) whether it is showing. Off the main thread: it's a shell
-     * round-trip.
-     */
-    private fun toggleKeyboard() {
-        Thread {
-            val shown = com.lume3d.everywhere.privileged.Privileged.isImeShown()
-            Log.i(TAG, "keyboard button: imeShown=$shown")
-            // Close = one BACK sent only to the virtual display. While the IME is up, the IME
-            // consumes that BACK and hides itself; the captured app does not navigate (verified on
-            // the LP2: mInputShown -> false, same resumed activity). Done right after the check to
-            // keep the window where the IME could vanish on its own (and BACK would then go back
-            // in the app) as small as possible.
-            if (shown) Capture3DService.active?.sendBackToApp()
-            else kbHandler.post { openKeyboard() }
-        }.start()
-    }
-
-    private fun openKeyboard() {
-        // The catcher is the IME's layering target, so the keyboard draws above the 3D by itself:
-        // just re-tap the last text field in the app. If the keyboard still isn't up after a beat
-        // (no field tapped yet, or a ROM where the layering trick fails), use the old box relay.
-        Capture3DService.active?.summonKeyboard()
-        Thread {
-            try { Thread.sleep(900) } catch (_: InterruptedException) { return@Thread }
-            if (com.lume3d.everywhere.privileged.Privileged.isImeShown()) Log.i(TAG, "keyboard up via direct tap")
-            else kbHandler.post { openKeyboardViaBox() }
-        }.start()
-    }
-
-    private fun openKeyboardViaBox() {
-        // Pop a momentary FOCUSABLE box from OUR app so the IME draws above the 3D overlay, then
-        // immediately hand focus back to the captured app's field (re-tap on the virtual display)
-        // and remove our box — WITHOUT hiding the soft input. The keyboard stays up, now rebound to
-        // the captured field, so the user types straight into it. No Send button needed.
-        if (inputWin == null) createInputBar()
-        val win = inputWin ?: return
-        win.visibility = View.VISIBLE
-        inputEdit?.let { e ->
-            e.requestFocus()
-            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
-                as android.view.inputmethod.InputMethodManager
-            imm.showSoftInput(e, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
-        }
-        kbHandler.removeCallbacksAndMessages(null)
-        kbHandler.postDelayed({
-            Capture3DService.active?.summonKeyboard()  // captured field reclaims focus + the IME
-            inputWin?.visibility = View.GONE           // get our box out of the way (keep IME up)
-        }, 600)
-    }
 
     private fun hideInputBar() {
         inputEdit?.let { e ->
@@ -1227,6 +1237,11 @@ class OverlayController(
 
     companion object {
         private const val TAG = "OverlayController"
+        private const val EDGE_NONE = -1
+        private const val EDGE_LEFT = 0
+        private const val EDGE_RIGHT = 1
+        private const val EDGE_TOP = 2
+        private const val EDGE_BOTTOM = 3
         // Windows of the most recent controller instance. A rotation rebuild creates a new
         // instance; if the old one's teardown failed mid-rotation, the new instance sweeps
         // these before adding its own (prevents stacked/doubled UI).
