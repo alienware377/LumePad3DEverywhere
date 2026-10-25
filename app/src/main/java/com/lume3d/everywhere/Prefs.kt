@@ -96,6 +96,13 @@ var Context.edgePassMargin: Int
     get() = prefs().getInt("edge_pass_margin", 0)
     set(v) { prefs().edit().putInt("edge_pass_margin", v).apply() }
 
+/** Leave touch holes over other apps' thin edge-trigger strips (Pie Control etc.), so their
+ *  swipes work without dimming the 3D or handing over the whole edge. Needs the OS touch-through
+ *  switch (or dimming) like any pass-through. */
+var Context.triggerHoles: Boolean
+    get() = prefs().getBoolean("trigger_holes", true)
+    set(v) { prefs().edit().putBoolean("trigger_holes", v).apply() }
+
 /** Disable Android's untrusted-touch block (via Shizuku) so touches released by pass-through
  *  reach other overlay apps through our opaque overlay. Device-wide security setting. */
 var Context.touchBlockDisabled: Boolean

@@ -40,7 +40,7 @@ object Privileged {
         try { Shizuku.pingBinder() && Shizuku.checkSelfPermission() == android.content.pm.PackageManager.PERMISSION_GRANTED }
         catch (t: Throwable) { false }
 
-    private fun ensureBypass() {
+    fun ensureBypass() {
         if (bypassReady) return
         // Allow reflective access to non-SDK (hidden) members for our process.
         HiddenApiBypass.addHiddenApiExemptions("")
@@ -161,6 +161,30 @@ object Privileged {
         val re = Regex("""taskId=(\d+):[^\n]*${Regex.escape(pkg)}""")
         re.find(out)?.groupValues?.get(1)?.toInt() ?: -1
     } catch (_: Throwable) { -1 }
+
+    /**
+     * Thin touch strips other apps keep along the screen edges (Pie Control's triggers and the
+     * like), in screen pixels: visible, touchable overlay windows of other packages that hug an
+     * edge and are at most [maxThickPx] thick. Read from `dumpsys window windows` as shell.
+     */
+    fun findEdgeTriggers(ownPkg: String, screenW: Int, screenH: Int, maxThickPx: Int): List<android.graphics.Rect> = try {
+        val out = runShellCapture(arrayOf("dumpsys", "window", "windows"))
+        val frameRe = Regex("""mFrame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]""")
+        val pkgRe = Regex("""package=(\S+)""")
+        val notTouchRe = Regex("""fl=[^\n]*NOT_TOUCHABLE""")
+        out.split(Regex("""\n\s+Window #\d+ """)).drop(1).mapNotNull { blk ->
+            val pkg = pkgRe.find(blk)?.groupValues?.get(1) ?: return@mapNotNull null
+            if (pkg == ownPkg || pkg == "android" || pkg == "com.android.systemui") return@mapNotNull null
+            if (!blk.contains("ty=APPLICATION_OVERLAY")) return@mapNotNull null
+            if (!blk.contains("isReadyForDisplay()=true") || !blk.contains("mViewVisibility=0x0")) return@mapNotNull null
+            if (notTouchRe.containsMatchIn(blk)) return@mapNotNull null
+            val g = frameRe.find(blk)?.groupValues ?: return@mapNotNull null
+            val r = android.graphics.Rect(g[1].toInt(), g[2].toInt(), g[3].toInt(), g[4].toInt())
+            val thick = minOf(r.width(), r.height())
+            val atEdge = r.left <= 2 || r.top <= 2 || r.right >= screenW - 2 || r.bottom >= screenH - 2
+            if (thick in 1..maxThickPx && atEdge) r else null
+        }
+    } catch (t: Throwable) { Log.w(TAG, "findEdgeTriggers failed: ${t.message}"); emptyList() }
 
     /** Bring a package back to the default display (display 0). Migrates the existing
      *  task without killing the process; falls back to a fresh launch if no task exists. */

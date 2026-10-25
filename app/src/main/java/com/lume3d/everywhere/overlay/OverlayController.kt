@@ -11,6 +11,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.SurfaceControl
 import android.view.View
+import android.view.ViewTreeObserver
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.SeekBar
@@ -45,6 +46,7 @@ import com.lume3d.everywhere.softKneeOn
 import com.lume3d.everywhere.softKneeStrength
 import com.lume3d.everywhere.softKneeThreshPct
 import com.lume3d.everywhere.touchBlockDisabled
+import com.lume3d.everywhere.triggerHoles
 import com.lume3d.everywhere.setFilterAmt
 import com.lume3d.everywhere.setFilterHi
 import com.lume3d.everywhere.setFilterLo
@@ -223,10 +225,63 @@ class OverlayController(
             true
         }
         removeWin(lastCatcherWin); lastCatcherWin = null
-        wm.addView(catcher, catcherLp())
+        val clp = catcherLp()
+        installTouchHoles(catcher, clp)
+        wm.addView(catcher, clp)
         touchCatcher = catcher
         lastCatcherWin = catcher
         Log.i(TAG, "touch catcher added: margin=$edgeMarginPx passThrough=$passThroughAll")
+    }
+
+    // ---- Touch holes over other apps' edge triggers -------------------------------------------
+    // The catcher keeps the whole screen except small holes exactly over other apps' thin edge
+    // strips (Pie Control's triggers). A touch that starts in a hole skips the catcher and, since
+    // the 3D window is NOT_TOUCHABLE, lands on that app's strip. No dimming, no lost edges. Needs
+    // the OS touch-through switch, like every pass-through (our opaque 3D sits above them).
+    // Android has no public per-window touch shape, so this uses the hidden insets callback that
+    // PopupWindow and the floating toolbar use (TOUCHABLE_INSETS_REGION).
+    @Volatile private var holes: List<android.graphics.Rect> = emptyList()
+
+    /** Screen-pixel rects to leave untouched; an empty list means the catcher takes everything. */
+    fun setTouchHoles(rects: List<android.graphics.Rect>) {
+        if (rects == holes) return
+        holes = rects
+        Log.i(TAG, "touch holes: $rects")
+        touchCatcher?.post { touchCatcher?.requestLayout() }
+    }
+
+    private fun installTouchHoles(catcher: View, lp: WindowManager.LayoutParams) {
+        try {
+            com.lume3d.everywhere.privileged.Privileged.ensureBypass()
+            val iface = Class.forName("android.view.ViewTreeObserver\$OnComputeInternalInsetsListener")
+            val listener = java.lang.reflect.Proxy.newProxyInstance(iface.classLoader, arrayOf(iface)) { self, m, args ->
+                when (m.name) {
+                    "onComputeInternalInsets" -> { applyHoles(args!![0], lp); null }
+                    "hashCode" -> System.identityHashCode(self)
+                    "equals" -> self === args?.getOrNull(0)
+                    "toString" -> "TouchHoles"
+                    else -> null
+                }
+            }
+            ViewTreeObserver::class.java.getMethod("addOnComputeInternalInsetsListener", iface)
+                .invoke(catcher.viewTreeObserver, listener)
+        } catch (t: Throwable) { Log.w(TAG, "touch holes unavailable: ${t.cause ?: t}") }
+    }
+
+    private fun applyHoles(info: Any, lp: WindowManager.LayoutParams) {
+        val hs = holes
+        val cls = info.javaClass
+        if (hs.isEmpty()) {
+            cls.getMethod("setTouchableInsets", Int::class.javaPrimitiveType).invoke(info, 0)  // whole frame
+            return
+        }
+        // Region is in the catcher's own coordinates; it sits at (lp.x, lp.y) on screen.
+        val region = cls.getField("touchableRegion").get(info) as android.graphics.Region
+        region.set(0, 0, lp.width, lp.height)
+        for (h in hs) {
+            region.op(h.left - lp.x, h.top - lp.y, h.right - lp.x, h.bottom - lp.y, android.graphics.Region.Op.DIFFERENCE)
+        }
+        cls.getMethod("setTouchableInsets", Int::class.javaPrimitiveType).invoke(info, 3)      // REGION
     }
 
     /** Re-add a window at the top of the z-order (removeImmediate keeps ordering deterministic). */
@@ -530,6 +585,17 @@ class OverlayController(
                 }
             })
 
+            val holesCheck = android.widget.CheckBox(context).apply {
+                text = "Let edge triggers through (Pie Control etc.)"
+                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
+                buttonTintList = passAccent
+                isChecked = context.triggerHoles
+                setOnCheckedChangeListener { _, on ->
+                    context.triggerHoles = on
+                    Capture3DService.active?.refreshTouchHoles()
+                }
+            }
+
             // CNSDK debug panel: the only way to reach Interlace Mode (View Peeling experiment).
             // While it's up, touches drive the panel instead of the captured app.
             val guiBtn = mkPanelBtn("🛠  CNSDK Debug Panel")
@@ -546,6 +612,7 @@ class OverlayController(
             settingsPanel.addView(passBtn, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
             settingsPanel.addView(edgeLabel)
             settingsPanel.addView(edgeSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
+            settingsPanel.addView(holesCheck, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT))
             settingsPanel.addView(blockCheck, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT))
             settingsPanel.addView(dimCheck, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT))
             settingsPanel.addView(dimLabel)

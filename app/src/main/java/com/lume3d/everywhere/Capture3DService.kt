@@ -493,6 +493,36 @@ class Capture3DService : Service() {
         Handler(mainLooper).post {
             applyVisibility()
         }
+        // A new overlay starts without holes; give other apps a beat to lay out (after rotation).
+        refreshTouchHoles(delayMs = 1200)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Touch holes over other apps' edge triggers (Pie Control). Their strips can move (settings,
+    // rotation), so re-read them now and then; one `dumpsys window` every 15 s is cheap.
+    // ---------------------------------------------------------------------------------------
+    private val holeExec = java.util.concurrent.Executors.newSingleThreadScheduledExecutor()
+    @Volatile private var holePollStarted = false
+
+    fun refreshTouchHoles(delayMs: Long = 0) {
+        if (stopped) return
+        try {
+            holeExec.schedule({ updateTouchHoles() }, delayMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (!holePollStarted) {
+                holePollStarted = true
+                holeExec.scheduleWithFixedDelay({ updateTouchHoles() }, 15, 15, java.util.concurrent.TimeUnit.SECONDS)
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {}
+    }
+
+    private fun updateTouchHoles() {
+        if (stopped || overlay == null) return
+        val rects = if (!applicationContext.triggerHoles) emptyList() else {
+            val b = getSystemService(android.view.WindowManager::class.java).maximumWindowMetrics.bounds
+            val maxThick = (48 * resources.displayMetrics.density).toInt()
+            Privileged.findEdgeTriggers(packageName, b.width(), b.height(), maxThick)
+        }
+        mainH.post { overlay?.setTouchHoles(rects) }
     }
 
     /**
@@ -840,6 +870,7 @@ class Capture3DService : Service() {
         renderer = null; overlay = null; virtualDisplay = null; imageReader = null
         displayId = -1
         keyExec.shutdownNow()
+        holeExec.shutdownNow()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
