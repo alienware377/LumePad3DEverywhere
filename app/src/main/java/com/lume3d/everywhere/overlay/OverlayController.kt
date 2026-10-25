@@ -17,39 +17,8 @@ import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import com.lume3d.everywhere.Capture3DService
-import com.lume3d.everywhere.FILTER_NAMES
+import com.lume3d.everywhere.*
 import com.lume3d.everywhere.LeiaHack
-import com.lume3d.everywhere.centerViewX100
-import com.lume3d.everywhere.interlaceMode
-import com.lume3d.everywhere.actStrength
-import com.lume3d.everywhere.convergence
-import com.lume3d.everywhere.depthSharpOn
-import com.lume3d.everywhere.depthSharpStrength
-import com.lume3d.everywhere.depthStrength
-import com.lume3d.everywhere.dimForPassThrough
-import com.lume3d.everywhere.edgePassMargin
-import com.lume3d.everywhere.filterAmt
-import com.lume3d.everywhere.ghostMaskOn
-import com.lume3d.everywhere.ghostMaskStrength
-import com.lume3d.everywhere.leiaNumViews
-import com.lume3d.everywhere.filterHi
-import com.lume3d.everywhere.filterLo
-import com.lume3d.everywhere.filterOn
-import com.lume3d.everywhere.filtersEnabled
-import com.lume3d.everywhere.ghost2CrossPct
-import com.lume3d.everywhere.ghost2HiStrength
-import com.lume3d.everywhere.ghost2Strength
-import com.lume3d.everywhere.ghostDesatStrength
-import com.lume3d.everywhere.passThroughDimPct
-import com.lume3d.everywhere.setFilterOn
-import com.lume3d.everywhere.softKneeOn
-import com.lume3d.everywhere.softKneeStrength
-import com.lume3d.everywhere.softKneeThreshPct
-import com.lume3d.everywhere.touchBlockDisabled
-import com.lume3d.everywhere.triggerHoles
-import com.lume3d.everywhere.setFilterAmt
-import com.lume3d.everywhere.setFilterHi
-import com.lume3d.everywhere.setFilterLo
 import com.leia.core.LogLevel
 import com.leia.sdk.LeiaSDK
 import com.leia.sdk.graphics.SurfaceTextureReadyCallback
@@ -94,8 +63,6 @@ class OverlayController(
     /** The service reports the user-Hide state (it can also change from the notification). */
     private var touchCatcher: View? = null
     private var catcherWanted = true   // false while the 3D is hidden (see setChromeVisible)
-    private var edgeMarginPx = 0
-    private var passThroughAll = false
     private var guiMode = false
     private var guiInited = false
     private var guiShown = false
@@ -174,15 +141,12 @@ class OverlayController(
 
     /**
      * A dedicated touch window that forwards gestures to the captured app, sitting between the
-     * 3D pixels (below) and the control bar (above). Inset by [edgeMarginPx] with
-     * FLAG_NOT_TOUCH_MODAL so gestures starting in the edge frame fall through to overlay apps
-     * below us (Pie Control's edge triggers etc.). When [passThroughAll] is on it becomes
-     * non-touchable, so the WHOLE screen passes through to other overlays.
+     * 3D pixels (below) and the control bar (above). FLAG_NOT_TOUCH_MODAL so touches in its
+     * holes (see [setTouchHoles]) fall through to other apps' edge triggers below us.
      */
     private fun catcherLp(): WindowManager.LayoutParams {
         val bounds = wm.maximumWindowMetrics.bounds
-        val m = edgeMarginPx.coerceIn(0, minOf(bounds.width(), bounds.height()) / 3)
-        var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+        val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
@@ -191,32 +155,26 @@ class OverlayController(
             // overlay, so Gboard (bound to the captured app's field on the VD) draws above the 3D
             // instead of hidden behind it (DisplayContent.computeImeParent).
             WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
-        if (passThroughAll) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
         val lp = WindowManager.LayoutParams(
-            bounds.width() - 2 * m, bounds.height() - 2 * m, type, flags, PixelFormat.TRANSLUCENT)
+            bounds.width(), bounds.height(), type, flags, PixelFormat.TRANSLUCENT)
         lp.gravity = Gravity.TOP or Gravity.START
-        lp.x = m; lp.y = m
         lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
         return lp
     }
 
     private fun addTouchCatcher() {
         if (!touchable || onTouch == null) return
-        edgeMarginPx = context.edgePassMargin
         val cb = onTouch
         removeWin(touchCatcher); touchCatcher = null
         val catcher = View(context)
         if (!catcherWanted) catcher.visibility = View.GONE   // rebuilt while 3D is hidden
         @Suppress("ClickableViewAccessibility")
         catcher.setOnTouchListener { _, ev ->
-            // Catcher origin is inset by the margin; shift back into full-3D-view space, then map
-            // by the live 3D view size (NOT panel size — the view is shorter than the panel by the
-            // system-inset strip, and mapping must use the actually-displayed height).
-            val m = (catcher.layoutParams as? WindowManager.LayoutParams)?.x ?: 0
-            ev.offsetLocation(m.toFloat(), m.toFloat())
+            // Map by the live 3D view size (NOT panel size: the view is shorter than the panel by
+            // the system-inset strip, and mapping must use the actually-displayed height).
             val b = wm.maximumWindowMetrics.bounds
             // In debug-GUI mode, touches drive CNSDK's built-in ImGui panel instead of being
             // injected into the captured app (the panel is how we reach Interlace Mode).
@@ -230,7 +188,7 @@ class OverlayController(
         wm.addView(catcher, clp)
         touchCatcher = catcher
         lastCatcherWin = catcher
-        Log.i(TAG, "touch catcher added: margin=$edgeMarginPx passThrough=$passThroughAll")
+        Log.i(TAG, "touch catcher added (holes=${holes.size})")
     }
 
     // ---- Touch holes over other apps' edge triggers -------------------------------------------
@@ -284,52 +242,6 @@ class OverlayController(
         cls.getMethod("setTouchableInsets", Int::class.javaPrimitiveType).invoke(info, 3)      // REGION
     }
 
-    /** Re-add a window at the top of the z-order (removeImmediate keeps ordering deterministic). */
-    private fun bringToFront(v: View?) {
-        v ?: return
-        val lp = v.layoutParams as? WindowManager.LayoutParams ?: return
-        try { wm.removeViewImmediate(v) } catch (_: Throwable) {}
-        try { wm.addView(v, lp) } catch (t: Throwable) { Log.e(TAG, "bringToFront failed: ${t.message}") }
-    }
-
-    /**
-     * Rebuild the catcher via remove+add (changing FLAG_NOT_TOUCHABLE with updateViewLayout
-     * leaves a stale input region, so the toggle silently did nothing). The fresh catcher lands
-     * on top, so we then lift the control bar and the input bar back above it.
-     *
-     * The input bar must be lifted even while it is GONE (which is nearly always): the system IME
-     * is layered just above that box, so if the catcher ends up above the box it also covers the
-     * keyboard and eats every key tap until the overlay is rebuilt from scratch.
-     */
-    private fun rebuildCatcher() {
-        addTouchCatcher()
-        bringToFront(tuneWin)
-        bringToFront(inputWin)
-    }
-
-    /** Full pass-through: make the catcher ignore touch so every overlay app below gets it. */
-    fun setPassThrough(on: Boolean) {
-        passThroughAll = on
-        updateOverlayDim()
-        (tuneWin ?: view)?.post { rebuildCatcher() } ?: rebuildCatcher()
-    }
-    fun isPassThrough() = passThroughAll
-
-    /** Edge pass-through margin in px; gestures inside this frame reach overlays below us. */
-    fun setEdgeMargin(px: Int) {
-        context.edgePassMargin = px
-        edgeMarginPx = px
-        updateOverlayDim()
-        (tuneWin ?: view)?.post { rebuildCatcher() } ?: rebuildCatcher()
-    }
-
-    /**
-     * "Dim to pass through" approach (alternative to the OS touch-block mod): while pass-through
-     * is active, lower the 3D window's opacity below the obscuring-opacity threshold (0.8) so the
-     * input system stops treating touches beneath us as untrusted. Full pass-through goes fully
-     * transparent; edge pass-through only needs to dip just under the threshold. No-op unless the
-     * user enabled the dim toggle.
-     */
     private var hidden3D = false
 
     /**
@@ -363,12 +275,7 @@ class OverlayController(
     fun updateOverlayDim() {
         val lp = rootLp ?: return
         val v = view ?: return
-        val dimA = (context.passThroughDimPct.coerceIn(10, 79)) / 100f
-        val alpha = if (hidden3D) 0f else if (!context.dimForPassThrough) 1f else when {
-            passThroughAll -> dimA        // user-set opacity (10..79%)
-            edgeMarginPx > 0 -> dimA
-            else -> 1f
-        }
+        val alpha = if (hidden3D) 0f else 1f
         if (lp.alpha == alpha) return
         lp.alpha = alpha
         try { wm.updateViewLayout(v, lp) } catch (t: Throwable) { Log.w(TAG, "dim failed: ${t.message}") }
@@ -446,13 +353,23 @@ class OverlayController(
             @Suppress("ClickableViewAccessibility")
             grip.setOnTouchListener { _, ev -> gd.onTouchEvent(ev); true }
 
-            // ── Settings panel (⚙): Hide Overlay + Depth/Convergence sliders ─────────────
+            // ── Settings panel (⚙) ──────────────────────────────────────────────────────────
+            // Show in 2D/3D on top, then collapsible sections that remember whether they're open.
+            // Each top section has a Reset link: it forgets the stored values (back to defaults)
+            // and re-syncs its controls through the `resyncs` each control registers.
             val settingsPanel = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 setBackgroundColor(0xE6101010.toInt())
                 val p = dp(12); setPadding(p, p, p, p)
                 visibility = View.GONE
             }
+            val seekW = dp(280)
+            val panelW = dp(280)
+            val wrap = LinearLayout.LayoutParams.WRAP_CONTENT
+            val accentColor = 0xFF9C7BFF.toInt()
+            val accent = android.content.res.ColorStateList.valueOf(accentColor)
+            fun resized() { (tuneWin as? DragLayout)?.onContentResized() }
+            fun refresh() { Capture3DService.active?.refreshParams() }
 
             val hideBtn = mkPanelBtn("👁  Show in 2D")
             syncHideBtn = { flat ->
@@ -463,196 +380,292 @@ class OverlayController(
             hideBtn.setOnClickListener {
                 Capture3DService.active?.setFlat2D(!hideOverlayActive)   // the service syncs us back
             }
+            settingsPanel.addView(hideBtn, LinearLayout.LayoutParams(panelW, wrap))
 
-            val divider1 = View(context).apply { setBackgroundColor(0xFF333333.toInt()) }
-
-            val depthLabel = android.widget.TextView(context).apply { setTextColor(0xFFD8DCE6.toInt()); textSize = 13f }
-            val depthSeek = SeekBar(context).apply { max = 100 }
-            val convLabel = android.widget.TextView(context).apply {
-                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                val mt = dp(8); setPadding(0, mt, 0, 0)
+            fun mkLabel(size: Float = 13f, topPad: Int = 6) = TextView(context).apply {
+                setTextColor(0xFFD8DCE6.toInt()); textSize = size
+                setPadding(0, dp(topPad), 0, 0)
             }
-            val convSeek = SeekBar(context).apply { max = 100 }
-            val actLabel = android.widget.TextView(context).apply {
-                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                val mt = dp(8); setPadding(0, mt, 0, 0)
+            fun mkCheck(title: String, checked: Boolean) = android.widget.CheckBox(context).apply {
+                text = title
+                setTextColor(0xFFFFFFFF.toInt()); textSize = 13f
+                buttonTintList = accent
+                isChecked = checked
             }
-            val actSeek = SeekBar(context).apply { max = 200 }
 
-            fun syncLabels() {
-                depthLabel.text = "Depth (pop-out): ${context.depthStrength}%"
-                convLabel.text = "Convergence: ${context.convergence}%"
-                actLabel.text = "Ghost fix: ${context.actStrength}%"
+            /** A labelled slider. Only the user's own drags write the setting. Returns its re-sync. */
+            fun addSlider(parent: LinearLayout, maxV: Int, get: () -> Int, set: (Int) -> Unit,
+                          label: (Int) -> String, onChange: () -> Unit = ::refresh): () -> Unit {
+                val lbl = mkLabel()
+                val seek = SeekBar(context).apply { max = maxV }
+                val sync = { seek.progress = get(); lbl.text = label(get()) }
+                sync()
+                seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                        if (!fromUser) return
+                        set(p); lbl.text = label(p); onChange()
+                    }
+                    override fun onStartTrackingTouch(sb: SeekBar?) {}
+                    override fun onStopTrackingTouch(sb: SeekBar?) {}
+                })
+                parent.addView(lbl)
+                parent.addView(seek, LinearLayout.LayoutParams(seekW, wrap))
+                return sync
             }
-            depthSeek.progress = context.depthStrength
-            convSeek.progress = context.convergence
-            actSeek.progress = context.actStrength
-            syncLabels()
 
-            depthSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    context.depthStrength = p; syncLabels(); Capture3DService.active?.refreshParams()
+            /**
+             * A collapsible section: tap its title to fold it. Top-level sections get a divider and,
+             * with [resetKeys], a Reset link. Nested ones (a [parent] given) share the parent's
+             * re-syncs so the parent's Reset covers them.
+             */
+            class Section(val body: LinearLayout, val resyncs: MutableList<() -> Unit>)
+            fun addSection(key: String, title: String, openByDefault: Boolean,
+                           resetKeys: List<String>? = null, parent: Section? = null,
+                           headerExtra: View? = null): Section {
+                val nested = parent != null
+                val host = parent?.body ?: settingsPanel
+                val body = LinearLayout(context).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(if (nested) 12 else 4), 0, 0, dp(4))
                 }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-            convSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    context.convergence = p; syncLabels(); Capture3DService.active?.refreshParams()
+                val sec = Section(body, parent?.resyncs ?: mutableListOf())
+                val header = LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(if (nested) 6 else 8), 0, dp(2))
                 }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-            actSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    context.actStrength = p; syncLabels(); Capture3DService.active?.refreshParams()
+                val titleView = TextView(context).apply {
+                    setTextColor(if (nested) 0xFFD8DCE6.toInt() else 0xFFFFFFFF.toInt())
+                    textSize = if (nested) 13f else 15f
+                    if (!nested) setTypeface(typeface, Typeface.BOLD)
+                    setPadding(0, dp(6), 0, dp(6))
                 }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-
-            val seekW = dp(280)
-            val panelW = dp(280)
-
-            val passAccent = android.content.res.ColorStateList.valueOf(0xFF9C7BFF.toInt())
-
-            // Two independent ways to let released touches reach other overlay apps:
-            val blockCheck = android.widget.CheckBox(context).apply {
-                text = "Allow touch-through (OS mod, no dimming)"
-                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                buttonTintList = passAccent
-                isChecked = context.touchBlockDisabled
-                setOnCheckedChangeListener { _, on -> Capture3DService.active?.setTouchBlockDisabled(on) }
-            }
-            val dimCheck = android.widget.CheckBox(context).apply {
-                text = "Dim 3D to pass through (no OS change)"
-                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                buttonTintList = passAccent
-                isChecked = context.dimForPassThrough
-                setOnCheckedChangeListener { _, on -> Capture3DService.active?.setDimForPassThrough(on) }
-            }
-            val dimLabel = android.widget.TextView(context).apply {
-                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                val mt = dp(4); setPadding(0, mt, 0, 0)
-            }
-            fun syncDim() { dimLabel.text = "Pass-through transparency: ${context.passThroughDimPct}%" }
-            syncDim()
-            val dimSeek = SeekBar(context).apply { max = 79; progress = context.passThroughDimPct.coerceIn(10, 79) }
-            dimSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    context.passThroughDimPct = p.coerceIn(10, 79); syncDim()
-                    Capture3DService.active?.setDimForPassThrough(context.dimForPassThrough)  // re-apply alpha
+                fun applyOpen(open: Boolean) {
+                    body.visibility = if (open) View.VISIBLE else View.GONE
+                    titleView.text = (if (open) "▾  " else "▸  ") + title
                 }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-
-            // Full touch pass-through: hand ALL touches to other overlay apps until toggled back.
-            val passBtn = mkPanelBtn("👆  Pass Touches to Other Apps")
-            fun syncPass() {
-                val on = Capture3DService.active?.isPassThrough() ?: false
-                passBtn.text = if (on) "👆  Touch: Other Apps (tap to reclaim)" else "👆  Pass Touches to Other Apps"
-                passBtn.setBackgroundColor(if (on) 0xFF224422.toInt() else 0xFF2A2A2A.toInt())
-            }
-            passBtn.setOnClickListener {
-                val on = !(Capture3DService.active?.isPassThrough() ?: false)
-                Log.i(TAG, "passBtn clicked -> passThrough=$on")
-                // Turning pass-through ON auto-enables dimming (so it works even without the OS
-                // mod); the user can still uncheck Dim afterward while pass-through stays on.
-                if (on && !context.dimForPassThrough) {
-                    context.dimForPassThrough = true; dimCheck.isChecked = true
-                    Capture3DService.active?.setDimForPassThrough(true)
+                titleView.setOnClickListener {
+                    val open = body.visibility != View.VISIBLE
+                    context.setSectionOpen(key, open); applyOpen(open); resized()
                 }
-                Capture3DService.active?.setPassThrough(on); syncPass()
-            }
-            syncPass()
-
-            val edgeLabel = android.widget.TextView(context).apply {
-                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                val mt = dp(8); setPadding(0, mt, 0, 0)
-            }
-            fun syncEdge() { edgeLabel.text = "Edge pass-through (for Pie Control etc.): ${context.edgePassMargin}px" }
-            syncEdge()
-            val edgeSeek = SeekBar(context).apply { max = 150; progress = context.edgePassMargin }
-            edgeSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    syncEdge()
+                header.addView(titleView, LinearLayout.LayoutParams(0, wrap, 1f))
+                headerExtra?.let { header.addView(it) }
+                if (resetKeys != null) {
+                    header.addView(TextView(context).apply {
+                        text = "Reset"
+                        setTextColor(accentColor); textSize = 12f
+                        val p = dp(8); setPadding(p, p, 0, p)
+                        setOnClickListener {
+                            context.resetPrefs(resetKeys)
+                            sec.resyncs.forEach { it() }
+                            refresh()
+                            Log.i(TAG, "reset section $key")
+                        }
+                    })
                 }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {
-                    Log.i(TAG, "edgeSeek released -> ${sb?.progress}px")
-                    Capture3DService.active?.setEdgeMargin(sb?.progress ?: 0)   // rebuild once on release
-                }
-            })
-
-            val holesCheck = android.widget.CheckBox(context).apply {
-                text = "Let edge triggers through (Pie Control etc.)"
-                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                buttonTintList = passAccent
-                isChecked = context.triggerHoles
-                setOnCheckedChangeListener { _, on ->
-                    context.triggerHoles = on
-                    Capture3DService.active?.refreshTouchHoles()
-                }
+                if (!nested) host.addView(View(context).apply { setBackgroundColor(0xFF333333.toInt()) },
+                    LinearLayout.LayoutParams(panelW, dp(1)).apply { topMargin = dp(8) })
+                host.addView(header, LinearLayout.LayoutParams(panelW, wrap))
+                host.addView(body)
+                applyOpen(context.sectionOpen(key, openByDefault))
+                return sec
             }
 
-            // CNSDK debug panel: the only way to reach Interlace Mode (View Peeling experiment).
-            // While it's up, touches drive the panel instead of the captured app.
-            val guiBtn = mkPanelBtn("🛠  CNSDK Debug Panel")
-            guiBtn.setOnClickListener {
-                val on = !(Capture3DService.active?.isDebugGui() ?: false)
-                Capture3DService.active?.setDebugGui(on)
-                guiBtn.text = if (on) "🛠  Debug Panel ON (tap to exit)" else "🛠  CNSDK Debug Panel"
-                guiBtn.setBackgroundColor(if (on) 0xFF224422.toInt() else 0xFF2A2A2A.toInt())
-                if (on) ctrlPanel?.visibility = View.GONE   // get our menu out of the way
+            /** An on/off effect whose sliders only show while it's on. */
+            fun addEffect(sec: Section, title: String, onGet: () -> Boolean, onSet: (Boolean) -> Unit,
+                          sliders: List<Triple<String, () -> Int, (Int) -> Unit>>, maxV: Int = 100) {
+                val body = LinearLayout(context).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(32), 0, 0, 0)
+                }
+                val cb = mkCheck(title, onGet())
+                for ((t, g, s) in sliders) sec.resyncs += addSlider(body, maxV, g, s, { "$t: $it%" })
+                fun show() { body.visibility = if (onGet()) View.VISIBLE else View.GONE; resized() }
+                cb.setOnCheckedChangeListener { _, on -> onSet(on); show(); refresh() }
+                sec.resyncs += { cb.isChecked = onGet(); show() }
+                sec.body.addView(cb)
+                sec.body.addView(body)
+                show()
             }
 
-            settingsPanel.addView(hideBtn, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT))
-            settingsPanel.addView(guiBtn, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
-            settingsPanel.addView(passBtn, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
-            settingsPanel.addView(edgeLabel)
-            settingsPanel.addView(edgeSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
-            settingsPanel.addView(holesCheck, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT))
-            settingsPanel.addView(blockCheck, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT))
-            settingsPanel.addView(dimCheck, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT))
-            settingsPanel.addView(dimLabel)
-            settingsPanel.addView(dimSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
-            settingsPanel.addView(divider1, LinearLayout.LayoutParams(panelW, dp(1)).apply { topMargin = dp(10); bottomMargin = dp(10) })
-            settingsPanel.addView(depthLabel)
-            settingsPanel.addView(depthSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
-            settingsPanel.addView(convLabel)
-            settingsPanel.addView(convSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
-            settingsPanel.addView(actLabel)
-            settingsPanel.addView(actSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
-
+            // ── 3D ──
+            val s3d = addSection("3d", "3D", openByDefault = true, resetKeys = KEYS_3D)
+            s3d.resyncs += addSlider(s3d.body, 100, { context.depthStrength }, { context.depthStrength = it },
+                { "Depth (pop-out): $it%" })
+            s3d.resyncs += addSlider(s3d.body, 100, { context.convergence }, { context.convergence = it },
+                { "Convergence: $it%" })
+            s3d.resyncs += addSlider(s3d.body, 200, { context.actStrength }, { context.actStrength = it },
+                { "Ghost fix: $it%" })
             // Center View: where the interlacer puts the L/R seam relative to your face. The
             // single most direct lever on the double-image (a mis-placed seam makes every eye
             // straddle it). Factory 2.64 on this panel; 2.24 measured better. 0.00..5.00.
-            val cvLabel = android.widget.TextView(context).apply {
-                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                val mt = dp(8); setPadding(0, mt, 0, 0)
-            }
-            fun syncCv() { cvLabel.text = "Center View (seam position): %.2f".format(context.centerViewX100 / 100f) }
-            syncCv()
-            val cvSeek = SeekBar(context).apply { max = 500; progress = context.centerViewX100 }
-            cvSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    context.centerViewX100 = p; syncCv()
-                    Capture3DService.active?.setCenterView(p / 100f)
-                }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-            settingsPanel.addView(cvLabel)
-            settingsPanel.addView(cvSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
+            val cvSync = addSlider(s3d.body, 500, { context.centerViewX100 }, { context.centerViewX100 = it },
+                { "Center View (seam position): %.2f".format(it / 100f) },
+                onChange = { Capture3DService.active?.setCenterView(context.centerViewX100 / 100f) })
+            s3d.resyncs += { cvSync(); Capture3DService.active?.setCenterView(context.centerViewX100 / 100f) }
 
-            // EXPERIMENTAL: View Peeling. Switches the native interlacer from Stereo Sliding (2
-            // source views + hard L/R seam) to true N-view, and feeds it one atlas tile per
-            // hardware view. Needs a restart of 3D because the atlas size is fixed at creation.
+            // ── Filters (parametric-EQ style: amount + the brightness range it touches) ──
+            val masterSwitch = android.widget.Switch(context).apply {
+                isChecked = context.filtersEnabled
+                thumbTintList = accent
+            }
+            val sf = addSection("filters", "Filters", openByDefault = false, resetKeys = KEYS_FILTERS,
+                headerExtra = masterSwitch)
+            val filterList = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+            val offNote = mkLabel(12f).apply { text = "Filters are off (switch above)." }
+            fun showFilters() {
+                val on = context.filtersEnabled
+                filterList.visibility = if (on) View.VISIBLE else View.GONE
+                offNote.visibility = if (on) View.GONE else View.VISIBLE
+                resized()
+            }
+            masterSwitch.setOnCheckedChangeListener { _, on ->
+                context.filtersEnabled = on; showFilters(); refresh()
+            }
+            sf.resyncs += { masterSwitch.isChecked = context.filtersEnabled; showFilters() }
+            sf.body.addView(offNote)
+            sf.body.addView(filterList)
+            for (i in FILTER_NAMES.indices) {
+                val head = LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                val fCheck = android.widget.CheckBox(context).apply { buttonTintList = accent; isChecked = context.filterOn(i) }
+                val fLabel = TextView(context).apply { setTextColor(0xFFFFFFFF.toInt()); textSize = 13f }
+                val rangeToggle = TextView(context).apply {
+                    setTextColor(accentColor); textSize = 12f
+                    val p = dp(8); setPadding(p, p, 0, p)
+                }
+                head.addView(fCheck)
+                head.addView(fLabel, LinearLayout.LayoutParams(0, wrap, 1f))
+                head.addView(rangeToggle)
+
+                val body = LinearLayout(context).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(32), 0, 0, 0)
+                }
+                fun syncF() {
+                    val amt = context.filterAmt(i) - 100
+                    fLabel.text = "${FILTER_NAMES[i]}: ${if (amt > 0) "+" else ""}$amt"
+                }
+                syncF()
+                val amtSeek = SeekBar(context).apply { max = 200; progress = context.filterAmt(i) }
+                amtSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                        if (!fromUser) return
+                        context.setFilterAmt(i, p); syncF(); refresh()
+                    }
+                    override fun onStartTrackingTouch(sb: SeekBar?) {}
+                    override fun onStopTrackingTouch(sb: SeekBar?) {}
+                })
+                body.addView(amtSeek, LinearLayout.LayoutParams(seekW, wrap))
+
+                // Brightness range (which part of the picture the filter touches), folded away.
+                val range = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+                val rangeLbl = mkLabel(12f, 2)
+                fun syncRange() { rangeLbl.text = "Brightness range: ${context.filterLo(i)} to ${context.filterHi(i)}%" }
+                syncRange()
+                val loSeek = SeekBar(context).apply { max = 100; progress = context.filterLo(i) }
+                val hiSeek = SeekBar(context).apply { max = 100; progress = context.filterHi(i) }
+                loSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                        if (!fromUser) return
+                        context.setFilterLo(i, p)
+                        if (p > context.filterHi(i)) { context.setFilterHi(i, p); hiSeek.progress = p }
+                        syncRange(); refresh()
+                    }
+                    override fun onStartTrackingTouch(sb: SeekBar?) {}
+                    override fun onStopTrackingTouch(sb: SeekBar?) {}
+                })
+                hiSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                        if (!fromUser) return
+                        context.setFilterHi(i, p)
+                        if (p < context.filterLo(i)) { context.setFilterLo(i, p); loSeek.progress = p }
+                        syncRange(); refresh()
+                    }
+                    override fun onStartTrackingTouch(sb: SeekBar?) {}
+                    override fun onStopTrackingTouch(sb: SeekBar?) {}
+                })
+                val pair = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+                val half = LinearLayout.LayoutParams(0, wrap, 1f)
+                pair.addView(loSeek, half)
+                pair.addView(hiSeek, LinearLayout.LayoutParams(0, wrap, 1f))
+                range.addView(rangeLbl)
+                range.addView(pair, LinearLayout.LayoutParams(seekW, wrap))
+                body.addView(range)
+
+                val rangeKey = "frange_$i"
+                fun showF() {
+                    val on = context.filterOn(i)
+                    body.visibility = if (on) View.VISIBLE else View.GONE
+                    rangeToggle.visibility = if (on) View.VISIBLE else View.GONE
+                    val open = context.sectionOpen(rangeKey, false)
+                    range.visibility = if (open) View.VISIBLE else View.GONE
+                    rangeToggle.text = if (open) "range ▾" else "range ▸"
+                    resized()
+                }
+                rangeToggle.setOnClickListener {
+                    context.setSectionOpen(rangeKey, !context.sectionOpen(rangeKey, false)); showF()
+                }
+                fCheck.setOnCheckedChangeListener { _, on -> context.setFilterOn(i, on); showF(); refresh() }
+                sf.resyncs += {
+                    fCheck.isChecked = context.filterOn(i)
+                    amtSeek.progress = context.filterAmt(i); loSeek.progress = context.filterLo(i)
+                    hiSeek.progress = context.filterHi(i)
+                    syncF(); syncRange(); showF()
+                }
+                filterList.addView(head)
+                filterList.addView(body)
+                showF()
+            }
+            showFilters()
+
+            // ── Ghost cleanup ──
+            val sg = addSection("ghost", "Ghost cleanup", openByDefault = false, resetKeys = KEYS_GHOST)
+            val s2 = addSection("ghost2", "Second pass", openByDefault = false, parent = sg)
+            sg.resyncs += addSlider(s2.body, 200, { context.ghost2Strength }, { context.ghost2Strength = it },
+                { "Darks: $it%" })
+            sg.resyncs += addSlider(s2.body, 200, { context.ghost2HiStrength }, { context.ghost2HiStrength = it },
+                { "Brights: $it%" })
+            sg.resyncs += addSlider(s2.body, 100, { context.ghost2CrossPct }, { context.ghost2CrossPct = it },
+                { "Split point (brightness): $it%" })
+            sg.resyncs += addSlider(sg.body, 200, { context.ghostDesatStrength }, { context.ghostDesatStrength = it },
+                { "Color ghost fix: $it%" })
+            addEffect(sg, "Soft-knee depth (tames extreme pop-out ghosts)",
+                { context.softKneeOn }, { context.softKneeOn = it },
+                listOf(
+                    Triple("Amount", { context.softKneeStrength }, { v: Int -> context.softKneeStrength = v }),
+                    Triple("Knee start", { context.softKneeThreshPct }, { v: Int -> context.softKneeThreshPct = v })))
+            addEffect(sg, "Edge ghost masking (softens ghost-prone edges)",
+                { context.ghostMaskOn }, { context.ghostMaskOn = it },
+                listOf(Triple("Amount", { context.ghostMaskStrength }, { v: Int -> context.ghostMaskStrength = v })))
+            addEffect(sg, "Crisp depth edges (sharpens depth on colour edges)",
+                { context.depthSharpOn }, { context.depthSharpOn = it },
+                listOf(Triple("Amount", { context.depthSharpStrength }, { v: Int -> context.depthSharpStrength = v })))
+
+            // ── Touch ──
+            val st = addSection("touch", "Touch", openByDefault = false, resetKeys = KEYS_TOUCH)
+            val holesCheck = mkCheck("Let edge triggers through (Pie Control etc.)", context.triggerHoles)
+            holesCheck.setOnCheckedChangeListener { _, on -> Capture3DService.active?.setTriggerHoles(on) }
+            st.resyncs += { holesCheck.isChecked = context.triggerHoles }
+            st.body.addView(holesCheck)
+            st.body.addView(mkLabel(11f, 0).apply {
+                text = "Leaves tiny touch holes over other apps' edge strips. While 3D runs, it also " +
+                    "relaxes Android's block on touches through overlays."
+                setTextColor(0xFF9AA3B2.toInt())
+                setPadding(dp(32), 0, 0, dp(4))
+            }, LinearLayout.LayoutParams(panelW, wrap))
+
+            // ── Experimental ──
+            val sx = addSection("experimental", "Experimental", openByDefault = false, resetKeys = KEYS_EXPERIMENTAL)
+            // View Peeling switches the native interlacer from Stereo Sliding (2 source views + hard
+            // L/R seam) to true N-view and feeds it one atlas tile per hardware view. Needs a 3D
+            // restart because the atlas size is fixed at creation.
             val vpBtn = mkPanelBtn("")
             fun syncVp() {
                 val on = context.interlaceMode == 0
-                vpBtn.text = if (on) "🧪  View Peeling: ON (restart 3D)" else "🧪  Try View Peeling (experimental)"
+                vpBtn.text = if (on) "🧪  View Peeling: ON (restart 3D)" else "🧪  Try View Peeling"
                 vpBtn.setBackgroundColor(if (on) 0xFF224422.toInt() else 0xFF2A2A2A.toInt())
             }
             syncVp()
@@ -664,204 +677,20 @@ class OverlayController(
                 syncVp()
                 Log.i(TAG, "view peeling -> $on (interlaceMode=${context.interlaceMode}, tiles=${context.leiaNumViews})")
             }
-            settingsPanel.addView(vpBtn, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+            sx.resyncs += { syncVp() }
+            sx.body.addView(vpBtn, LinearLayout.LayoutParams(panelW, wrap).apply { topMargin = dp(8) })
 
-            // ── band-limited visual filters (parametric-EQ style: amount + luminance band) ──
-            settingsPanel.addView(View(context).apply { setBackgroundColor(0xFF333333.toInt()) },
-                LinearLayout.LayoutParams(seekW, dp(1)).apply { topMargin = dp(10); bottomMargin = dp(6) })
-
-            val accent = android.content.res.ColorStateList.valueOf(0xFF9C7BFF.toInt())
-            val filterGroups = mutableListOf<Pair<android.widget.CheckBox, LinearLayout>>()
-            fun refreshFilterStyles(master: Boolean) {
-                filterGroups.forEach { (cb, body) ->
-                    val on = master && cb.isChecked
-                    body.alpha = if (on) 1f else 0.35f
-                    fun setEnabledDeep(v: View, e: Boolean) {
-                        v.isEnabled = e
-                        if (v is android.view.ViewGroup) for (c in 0 until v.childCount) setEnabledDeep(v.getChildAt(c), e)
-                    }
-                    setEnabledDeep(body, on)
-                    cb.isEnabled = master
-                    cb.alpha = if (master) 1f else 0.35f
-                }
+            // CNSDK debug panel: the only way to reach Interlace Mode by hand. While it's up,
+            // touches drive the panel instead of the captured app.
+            val guiBtn = mkPanelBtn("🛠  CNSDK Debug Panel")
+            guiBtn.setOnClickListener {
+                val on = !(Capture3DService.active?.isDebugGui() ?: false)
+                Capture3DService.active?.setDebugGui(on)
+                guiBtn.text = if (on) "🛠  Debug Panel ON (tap to exit)" else "🛠  CNSDK Debug Panel"
+                guiBtn.setBackgroundColor(if (on) 0xFF224422.toInt() else 0xFF2A2A2A.toInt())
+                if (on) ctrlPanel?.visibility = View.GONE   // get our menu out of the way
             }
-
-            val masterCheck = android.widget.CheckBox(context).apply {
-                text = "Filters  (amount · brightness range)"
-                setTextColor(0xFF9AA3B2.toInt()); textSize = 12f
-                buttonTintList = accent
-                isChecked = context.filtersEnabled
-            }
-            masterCheck.setOnCheckedChangeListener { _, on ->
-                context.filtersEnabled = on
-                refreshFilterStyles(on)
-                Capture3DService.active?.refreshParams()
-            }
-            settingsPanel.addView(masterCheck)
-
-            for (i in FILTER_NAMES.indices) {
-                val fCheck = android.widget.CheckBox(context).apply {
-                    buttonTintList = accent
-                    isChecked = context.filterOn(i)
-                }
-                val fLabel = android.widget.TextView(context).apply {
-                    setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                }
-                fun syncF() {
-                    val amt = context.filterAmt(i) - 100
-                    val sign = if (amt > 0) "+" else ""
-                    fLabel.text = "${FILTER_NAMES[i]}: $sign$amt  ·  ${context.filterLo(i)}–${context.filterHi(i)}%"
-                }
-                syncF()
-                val amtSeek = SeekBar(context).apply { max = 200; progress = context.filterAmt(i) }
-                val loSeek = SeekBar(context).apply { max = 100; progress = context.filterLo(i) }
-                val hiSeek = SeekBar(context).apply { max = 100; progress = context.filterHi(i) }
-                amtSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                        context.setFilterAmt(i, p); syncF(); Capture3DService.active?.refreshParams()
-                    }
-                    override fun onStartTrackingTouch(sb: SeekBar?) {}
-                    override fun onStopTrackingTouch(sb: SeekBar?) {}
-                })
-                loSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                        context.setFilterLo(i, p)
-                        if (p > context.filterHi(i)) { context.setFilterHi(i, p); hiSeek.progress = p }
-                        syncF(); Capture3DService.active?.refreshParams()
-                    }
-                    override fun onStartTrackingTouch(sb: SeekBar?) {}
-                    override fun onStopTrackingTouch(sb: SeekBar?) {}
-                })
-                hiSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                        context.setFilterHi(i, p)
-                        if (p < context.filterLo(i)) { context.setFilterLo(i, p); loSeek.progress = p }
-                        syncF(); Capture3DService.active?.refreshParams()
-                    }
-                    override fun onStartTrackingTouch(sb: SeekBar?) {}
-                    override fun onStopTrackingTouch(sb: SeekBar?) {}
-                })
-
-                val headRow = LinearLayout(context).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    val mt = dp(6); setPadding(0, mt, 0, 0)
-                }
-                headRow.addView(fCheck)
-                headRow.addView(fLabel)
-
-                val body = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-                val range = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-                val half = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                range.addView(loSeek, half)
-                range.addView(hiSeek, half)
-                body.addView(amtSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
-                body.addView(range, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-                fCheck.setOnCheckedChangeListener { _, on ->
-                    context.setFilterOn(i, on)
-                    refreshFilterStyles(context.filtersEnabled)
-                    Capture3DService.active?.refreshParams()
-                }
-                filterGroups.add(fCheck to body)
-                settingsPanel.addView(headRow)
-                settingsPanel.addView(body)
-            }
-            refreshFilterStyles(context.filtersEnabled)
-
-            // ── post-filter ghost fix (2nd pass, no black-lift) ──
-            settingsPanel.addView(View(context).apply { setBackgroundColor(0xFF333333.toInt()) },
-                LinearLayout.LayoutParams(seekW, dp(1)).apply { topMargin = dp(10); bottomMargin = dp(6) })
-            fun addSlider(maxV: Int, get: () -> Int, set: (Int) -> Unit, text: (Int) -> String) {
-                val lbl = android.widget.TextView(context).apply {
-                    setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                    val mt = dp(6); setPadding(0, mt, 0, 0)
-                    this.text = text(get())
-                }
-                val seek = SeekBar(context).apply { max = maxV; progress = get() }
-                seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                        set(p); lbl.text = text(p); Capture3DService.active?.refreshParams()
-                    }
-                    override fun onStartTrackingTouch(sb: SeekBar?) {}
-                    override fun onStopTrackingTouch(sb: SeekBar?) {}
-                })
-                settingsPanel.addView(lbl)
-                settingsPanel.addView(seek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
-            }
-            addSlider(200, { context.ghost2Strength }, { context.ghost2Strength = it },
-                { "2nd Pass Ghost Fix (darks): $it%" })
-            addSlider(200, { context.ghost2HiStrength }, { context.ghost2HiStrength = it },
-                { "2nd Pass Ghost Fix (brights): $it%" })
-            addSlider(100, { context.ghost2CrossPct }, { context.ghost2CrossPct = it },
-                { "2nd Pass Split Brightness: $it%" })
-
-            val gdLabel = android.widget.TextView(context).apply {
-                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
-                val mt = dp(8); setPadding(0, mt, 0, 0)
-            }
-            fun syncGd() { gdLabel.text = "Color Ghost Fix: ${context.ghostDesatStrength}%" }
-            syncGd()
-            val gdSeek = SeekBar(context).apply { max = 200; progress = context.ghostDesatStrength }
-            gdSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    context.ghostDesatStrength = p; syncGd(); Capture3DService.active?.refreshParams()
-                }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-            settingsPanel.addView(gdLabel)
-            settingsPanel.addView(gdSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
-
-            // ── extra ghost/quality effects: each an on/off + strength (+ optional 2nd slider) ──
-            settingsPanel.addView(View(context).apply { setBackgroundColor(0xFF333333.toInt()) },
-                LinearLayout.LayoutParams(seekW, dp(1)).apply { topMargin = dp(10); bottomMargin = dp(6) })
-            fun addEffect(title: String, onGet: () -> Boolean, onSet: (Boolean) -> Unit,
-                          sliders: List<Triple<String, () -> Int, (Int) -> Unit>>, maxV: Int = 100) {
-                val body = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-                fun restyle() {
-                    val on = onGet()
-                    body.alpha = if (on) 1f else 0.35f
-                    for (c in 0 until body.childCount) body.getChildAt(c).isEnabled = on
-                }
-                val cb = android.widget.CheckBox(context).apply {
-                    text = title
-                    setTextColor(0xFFFFFFFF.toInt()); textSize = 13f
-                    buttonTintList = passAccent
-                    isChecked = onGet()
-                    val mt = dp(6); setPadding(paddingLeft, mt, 0, 0)
-                }
-                for ((lblText, g, s) in sliders) {
-                    val lbl = android.widget.TextView(context).apply {
-                        setTextColor(0xFFD8DCE6.toInt()); textSize = 12f; text = "$lblText: ${g()}%"
-                    }
-                    val seek = SeekBar(context).apply { max = maxV; progress = g() }
-                    seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                        override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                            s(p); lbl.text = "$lblText: $p%"; Capture3DService.active?.refreshParams()
-                        }
-                        override fun onStartTrackingTouch(sb: SeekBar?) {}
-                        override fun onStopTrackingTouch(sb: SeekBar?) {}
-                    })
-                    body.addView(lbl)
-                    body.addView(seek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
-                }
-                cb.setOnCheckedChangeListener { _, on -> onSet(on); restyle(); Capture3DService.active?.refreshParams() }
-                restyle()
-                settingsPanel.addView(cb)
-                settingsPanel.addView(body)
-            }
-            addEffect("Soft-knee depth (tames extreme pop-out ghosts)",
-                { context.softKneeOn }, { context.softKneeOn = it },
-                listOf(
-                    Triple("Amount", { context.softKneeStrength }, { v: Int -> context.softKneeStrength = v }),
-                    Triple("Knee start", { context.softKneeThreshPct }, { v: Int -> context.softKneeThreshPct = v })))
-            addEffect("Edge ghost masking (softens ghost-prone edges)",
-                { context.ghostMaskOn }, { context.ghostMaskOn = it },
-                listOf(Triple("Amount", { context.ghostMaskStrength }, { v: Int -> context.ghostMaskStrength = v })))
-            addEffect("Crisp depth edges (sharpens depth on colour edges)",
-                { context.depthSharpOn }, { context.depthSharpOn = it },
-                listOf(Triple("Amount", { context.depthSharpStrength }, { v: Int -> context.depthSharpStrength = v })))
+            sx.body.addView(guiBtn, LinearLayout.LayoutParams(panelW, wrap).apply { topMargin = dp(6) })
 
             gear.setOnClickListener {
                 ctrlPanel?.let { it.visibility = if (it.visibility == View.GONE) View.VISIBLE else View.GONE }
@@ -875,13 +704,19 @@ class OverlayController(
             bar.addView(close)
             root.addView(bar)
             root.dragHandle = bar   // drag from the button row only; the panel scrolls
-            // The panel is tall now (filter EQ) — scroll it, capped well under screen height.
-            val scroll = android.widget.ScrollView(context).apply {
+            // Scrolls once the open sections get tall; otherwise only as tall as its content, so
+            // no empty strip of the window sits over the app eating taps.
+            val maxPanelH = dp(480)
+            val scroll = object : android.widget.ScrollView(context) {
+                override fun onMeasure(widthSpec: Int, heightSpec: Int) {
+                    super.onMeasure(widthSpec, View.MeasureSpec.makeMeasureSpec(maxPanelH, View.MeasureSpec.AT_MOST))
+                }
+            }.apply {
                 addView(settingsPanel)
                 visibility = View.GONE
             }
             root.addView(scroll, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, dp(480)))
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
             settingsPanel.visibility = View.VISIBLE   // visibility now driven by the scroll wrapper
 
             ctrlBtns = listOf(gear, kb, close)

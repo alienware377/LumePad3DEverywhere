@@ -74,10 +74,10 @@ class Capture3DService : Service() {
         if (!Privileged.isShizukuReady()) {
             Log.e(TAG, "Shizuku not ready"); stopSelf(); return START_NOT_STICKY
         }
-        // User-consented touch-block mod: let touches released by our pass-through reach other
-        // overlay apps (Android 12 otherwise flags them untrusted through our opaque overlay).
-        if (applicationContext.touchBlockDisabled) Privileged.allowTouchThroughOverlay()
-        else Privileged.restoreTouchBlock()
+        // "Let edge triggers through": touches that start in a hole must reach the other app's
+        // strip through our opaque 3D, which Android 12 blocks as untrusted unless this OS switch
+        // is relaxed. Put back on Stop (or when the option is turned off).
+        if (applicationContext.triggerHoles) setTouchMod(true)
         targetPkg = applicationContext.targetPackage
         if (targetPkg == null) { Log.e(TAG, "no target package"); stopSelf(); return START_NOT_STICKY }
 
@@ -598,15 +598,18 @@ class Capture3DService : Service() {
     /** Re-apply slider values to the live renderer (called from the UI). */
     fun refreshParams() { renderer?.let { applyParams(it) } }
 
-    /** Full touch pass-through: let other overlay apps receive all touches. */
-    fun setPassThrough(on: Boolean) { overlay?.setPassThrough(on) }
-    fun isPassThrough(): Boolean = overlay?.isPassThrough() ?: false
-    /** Edge pass-through margin in px. */
-    fun setEdgeMargin(px: Int) { overlay?.setEdgeMargin(px) }
-    /** Toggle the OS untrusted-touch block mod (applies immediately via Shizuku). */
-    fun setTouchBlockDisabled(on: Boolean) {
-        applicationContext.touchBlockDisabled = on
-        Thread { if (on) Privileged.allowTouchThroughOverlay() else Privileged.restoreTouchBlock() }.start()
+    /** "Let edge triggers through" on/off: the holes and the OS touch switch they need, together. */
+    fun setTriggerHoles(on: Boolean) {
+        applicationContext.triggerHoles = on
+        Thread { setTouchMod(on) }.start()
+        refreshTouchHoles()
+    }
+
+    @Volatile private var touchModApplied = false
+    private fun setTouchMod(on: Boolean) {
+        if (on == touchModApplied) return
+        touchModApplied = on
+        if (on) Privileged.allowTouchThroughOverlay() else Privileged.restoreTouchBlock()
     }
     /** Where the interlacer places the L/R view seam relative to the tracked face. */
     fun setCenterView(v: Float) { overlay?.setCenterView(v) }
@@ -614,12 +617,6 @@ class Capture3DService : Service() {
     /** Show/hide CNSDK's built-in debug panel. */
     fun setDebugGui(on: Boolean) { overlay?.setDebugGui(on) }
     fun isDebugGui(): Boolean = overlay?.isDebugGui() ?: false
-
-    /** Toggle the dim-to-pass-through approach (re-applies overlay opacity live). */
-    fun setDimForPassThrough(on: Boolean) {
-        applicationContext.dimForPassThrough = on
-        overlay?.updateOverlayDim()
-    }
 
     /** Show the captured app flat (2D, still touchable) or back in 3D. */
     fun setFlat2D(on: Boolean) = mainH.post {
@@ -856,8 +853,9 @@ class Capture3DService : Service() {
         mainH.removeCallbacksAndMessages(null)
         Session3DActivity.close()
         // Undo the OS-wide touch-block change we made at start, so Android is left as we found it.
-        if (applicationContext.touchBlockDisabled) {
+        if (touchModApplied) {
             try { Privileged.restoreTouchBlock() } catch (_: Throwable) {}
+            touchModApplied = false
         }
         // Bring the app back to the real screen so the user doesn't lose it.
         if (returnApp) { try { targetPkg?.let { Privileged.moveBackToDefault(it) } } catch (_: Throwable) {} }

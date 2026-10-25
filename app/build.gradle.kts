@@ -11,8 +11,8 @@ android {
         applicationId = "com.lume3d.everywhere"
         minSdk = 30          // CNSDK requires >= 30; Lume Pad 2 ships Android 13 (API 33)
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.1.1"
+        versionCode = 4
+        versionName = "1.1.2"
 
         // CNSDK native libs ship arm64-v8a only (Lume Pad 2 is arm64).
         ndk { abiFilters += "arm64-v8a" }

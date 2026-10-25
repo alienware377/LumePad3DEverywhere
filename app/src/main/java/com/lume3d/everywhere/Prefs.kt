@@ -90,36 +90,29 @@ var Context.interlaceMode: Int
     get() = prefs().getInt("interlace_mode", -1)
     set(v) { prefs().edit().putInt("interlace_mode", v).apply() }
 
-/** Edge pass-through margin (px). Gestures starting within this frame of the screen edge
- *  fall through to overlay apps below us (Pie Control triggers, etc.). 0 = disabled. */
-var Context.edgePassMargin: Int
-    get() = prefs().getInt("edge_pass_margin", 0)
-    set(v) { prefs().edit().putInt("edge_pass_margin", v).apply() }
-
 /** Leave touch holes over other apps' thin edge-trigger strips (Pie Control etc.), so their
- *  swipes work without dimming the 3D or handing over the whole edge. Needs the OS touch-through
- *  switch (or dimming) like any pass-through. */
+ *  swipes work without dimming the 3D or handing over the whole edge. Also relaxes Android's
+ *  untrusted-touch block while 3D runs (needed to reach them through our opaque overlay). */
 var Context.triggerHoles: Boolean
     get() = prefs().getBoolean("trigger_holes", true)
     set(v) { prefs().edit().putBoolean("trigger_holes", v).apply() }
 
-/** Disable Android's untrusted-touch block (via Shizuku) so touches released by pass-through
- *  reach other overlay apps through our opaque overlay. Device-wide security setting. */
-var Context.touchBlockDisabled: Boolean
-    get() = prefs().getBoolean("touch_block_disabled", true)
-    set(v) { prefs().edit().putBoolean("touch_block_disabled", v).apply() }
+/** Settings-panel section open/closed state (UI only). */
+fun Context.sectionOpen(key: String, default: Boolean): Boolean = prefs().getBoolean("ui_open_$key", default)
+fun Context.setSectionOpen(key: String, v: Boolean) { prefs().edit().putBoolean("ui_open_$key", v).apply() }
 
-/** Alternative to the OS mod: dim the 3D overlay below the obscuring-opacity threshold while
- *  pass-through is active, so touches pass through as trusted without changing any OS setting. */
-var Context.dimForPassThrough: Boolean
-    get() = prefs().getBoolean("dim_for_passthrough", false)
-    set(v) { prefs().edit().putBoolean("dim_for_passthrough", v).apply() }
+/** Reset settings to their defaults by forgetting the stored values. */
+fun Context.resetPrefs(keys: List<String>) {
+    val e = prefs().edit(); keys.forEach { e.remove(it) }; e.apply()
+}
 
-/** Pass-through dim opacity, 10..79 (%). Must stay below 80 to clear the untrusted-touch
- *  obscuring threshold. Used for both edge and full pass-through when dimming is active. */
-var Context.passThroughDimPct: Int
-    get() = prefs().getInt("passthrough_dim_pct", 40)
-    set(v) { prefs().edit().putInt("passthrough_dim_pct", v).apply() }
+/** Pref keys per settings-panel section, for its Reset link. */
+val KEYS_3D = listOf("depth_strength", "convergence", "act_strength", "center_view_x100")
+val KEYS_FILTERS = listOf("f_master") + FILTER_KEYS.flatMap { k -> listOf("f_${k}_on", "f_${k}_a", "f_${k}_lo", "f_${k}_hi") }
+val KEYS_GHOST = listOf("ghost2_strength", "ghost2_hi", "ghost2_cross", "ghost_desat",
+    "softknee_on", "softknee_str", "softknee_thresh", "ghostmask_on", "ghostmask_str", "depthsharp_on", "depthsharp_str")
+val KEYS_TOUCH = listOf("trigger_holes")
+val KEYS_EXPERIMENTAL = listOf("interlace_mode", "leia_num_views")
 
 // ── Ghost/quality effects (all default off) ──
 var Context.softKneeOn: Boolean
