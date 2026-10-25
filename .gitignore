@@ -20,3 +20,8 @@ local.properties
 
 # Scratch: extracted CNSDK AAR (jar/native libs) used for API spelunking
 /_tmp_cnsdk/
+
+# Release APKs and local scratch
+/*.apk
+/_aar/
+/app/.cxx/

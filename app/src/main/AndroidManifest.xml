@@ -53,6 +53,19 @@
             </intent-filter>
         </activity>
 
+        <!-- The 3D session's body on the real screen: sits under the 3D overlay so BACK, HOME and
+             Recents behave like a normal app (see Session3DActivity). Own task so it gets its own
+             Recents card. stateUnchanged: taking focus on a BACK must not hide the captured app's
+             keyboard. Broad configChanges: rotation must not restart it. -->
+        <activity
+            android:name=".Session3DActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:taskAffinity="com.lume3d.everywhere.session"
+            android:theme="@android:style/Theme.Black.NoTitleBar"
+            android:windowSoftInputMode="stateUnchanged|adjustNothing"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation|uiMode" />
+
         <service
             android:name=".Capture3DService"
             android:exported="false"

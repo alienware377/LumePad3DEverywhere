@@ -27,9 +27,11 @@ class StereoRenderer(
     private val outputTexture: SurfaceTexture,
     private val captureW: Int,
     private val captureH: Int,
+    /** Atlas tile count: one per panel hardware view (see Prefs.leiaNumViews). */
+    private val numViews: Int = 2,
 ) {
     private val appContext = context.applicationContext
-    private val sbsW = captureW * NUM_VIEWS
+    private val sbsW = captureW * numViews
     private val sbsH = captureH
 
     // ---- tunables (set from UI) ----
@@ -38,6 +40,11 @@ class StereoRenderer(
     @Volatile var flipY = 1.0f          // 1 = flip output vertically (verify on device)
     @Volatile var swapLr = 0.0f         // 1 = swap eyes (fix pseudoscopic depth)
     @Volatile var ghost = 0.0f          // crosstalk pre-compensation coefficient (0..~0.5)
+    /** While the 3D is hidden: drop frames, no depth inference, no drawing (saves the NPU/GPU). */
+    /** Show the app flat (no depth, no ghost passes). Depth inference is skipped too. */
+    @Volatile var flat2D = false
+    @Volatile var paused = false
+    private var glReady = false
     // Post-filter 2nd pass (pure subtraction, no pedestal), split into two brightness bands
     // with a soft crossover at ghost2Cross (0..1 luminance).
     @Volatile var ghost2Lo = 0.0f       // strength below the crossover
@@ -106,11 +113,12 @@ class StereoRenderer(
     private var depth: DepthEstimator? = null
 
     companion object {
-        // Views in the horizontal atlas fed to CNSDK. MUST be 2: the native interlacer
-        // hardcodes softwareViews=2 for horizontal video layouts (a 4-view atlas renders
-        // squished/doubled — tested 2026-07-26). The shader below generalizes to any N,
-        // but CNSDK won't sample more than 2 tiles from a video surface.
-        const val NUM_VIEWS = 2
+        // Historical note: with the STOCK CNSDK interlace shader this had to be 2: the native
+        // GetNumberOfSourceViews() returns a hard-coded 2 while interlaceMode == 2 (the boot
+        // default, no JNI setter), pinning the softwareViews uniform, so a 4-tile atlas rendered
+        // squished/doubled. We now ship a patched assets/shaders/interlace.pshader that tiles by
+        // hardwareViewsX instead, so the count is the panel's real view count (Prefs.leiaNumViews).
+        const val LEGACY_NUM_VIEWS = 2
         private const val MSG_INIT = 1
         private const val MSG_FRAME = 2
         private const val MSG_DEPTH_RESULT = 3
@@ -173,10 +181,21 @@ class StereoRenderer(
     }
 
     private fun initGl() {
-        egl = EglCore(Surface(outputTexture))
+        // Attaching to CNSDK's SurfaceTexture can fail transiently (EGL_BAD_ALLOC = still attached
+        // elsewhere). Retry briefly, and never let a failure here kill the whole app.
+        var core: EglCore? = null
+        for (attempt in 1..6) {
+            core = try { EglCore(Surface(outputTexture)) } catch (t: Throwable) {
+                android.util.Log.w("StereoRenderer", "EGL surface attempt $attempt failed: ${t.message}"); null
+            }
+            if (core != null) break
+            try { Thread.sleep(150) } catch (_: InterruptedException) { return }
+        }
+        if (core == null) { android.util.Log.e("StereoRenderer", "giving up on EGL surface; renderer idle"); return }
+        egl = core
         egl.makeCurrent()
 
-        program = GlUtil.program(VS, FS)
+        program = GlUtil.program(VS, fsSource(numViews))
         aPos = GLES20.glGetAttribLocation(program, "aPos")
         aUv = GLES20.glGetAttribLocation(program, "aUv")
         uFrame = GLES20.glGetUniformLocation(program, "uFrame")
@@ -228,6 +247,7 @@ class StereoRenderer(
             android.util.Log.e("StereoRenderer", "DepthEstimator init failed: ${t.message}", t); null
         }
         android.util.Log.i("StereoRenderer", "GL init complete, sbs=${sbsW}x$sbsH")
+        glReady = true
     }
 
     private fun bindTex2d(tex: Int) {
@@ -239,6 +259,8 @@ class StereoRenderer(
     }
 
     private fun drawFrame() {
+        if (!glReady) return
+        if (paused) { synchronized(frameLock) { pendingFrame = null }; return }
         val buf: ByteBuffer; val w: Int; val h: Int
         synchronized(frameLock) {
             buf = pendingFrame ?: return
@@ -260,7 +282,7 @@ class StereoRenderer(
         // Downscale into the FBO every frame: it doubles as the clarity filter's blur
         // source. Depth readback/dispatch off it stays throttled.
         blitToDownscale()
-        if (depth != null && !depthBusy && (frameCounter % DEPTH_EVERY == 0)) {
+        if (!flat2D && depth != null && !depthBusy && (frameCounter % DEPTH_EVERY == 0)) {
             runReadbackAndDispatch()
         }
         frameCounter++
@@ -278,19 +300,22 @@ class StereoRenderer(
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, it.texture)
             GLES20.glUniform1i(uBlur, 2)
         }
-        GLES20.glUniform1f(uBaseline, baseline)
+        // Flat 2D: both eyes get the same picture, so every depth and ghost pass goes to zero.
+        // The colour filters stay, so 2D looks the same as the 3D minus the depth.
+        val flat = flat2D
+        GLES20.glUniform1f(uBaseline, if (flat) 0f else baseline)
         GLES20.glUniform1f(uConv, convergence)
         GLES20.glUniform1f(uFlip, flipY)
         GLES20.glUniform1f(uSwap, swapLr)
-        GLES20.glUniform1f(uGhost, ghost)
-        GLES20.glUniform1f(uGhost2Lo, ghost2Lo)
-        GLES20.glUniform1f(uGhost2Hi, ghost2Hi)
+        GLES20.glUniform1f(uGhost, if (flat) 0f else ghost)
+        GLES20.glUniform1f(uGhost2Lo, if (flat) 0f else ghost2Lo)
+        GLES20.glUniform1f(uGhost2Hi, if (flat) 0f else ghost2Hi)
         GLES20.glUniform1f(uGhost2X, ghost2Cross)
         GLES20.glUniform1f(uGhDesat, ghostDesat)
-        GLES20.glUniform1f(uSoftKnee, softKnee)
+        GLES20.glUniform1f(uSoftKnee, if (flat) 0f else softKnee)
         GLES20.glUniform1f(uSoftKneeT, softKneeThresh)
-        GLES20.glUniform1f(uGhMask, ghostMask)
-        GLES20.glUniform1f(uDepthSharp, depthSharp)
+        GLES20.glUniform1f(uGhMask, if (flat) 0f else ghostMask)
+        GLES20.glUniform1f(uDepthSharp, if (flat) 0f else depthSharp)
         GLES20.glUniform3fv(uFilt, 6, filters, 0)
         GLES20.glUniform2f(uPx, 1f / w, 1f / h)
 
@@ -402,7 +427,7 @@ void main() {
 // old 2-view SBS — the intermediate views just halve/third the step between ADJACENT panel
 // views, which is what lenticular crosstalk ghosting is proportional to. N=2 reproduces the
 // old behavior exactly (tiles 0,1 -> coef +1,-1).
-private const val FS = """#version 300 es
+private fun fsSource(numViews: Int) = """#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 frag;
@@ -411,7 +436,7 @@ uniform sampler2D uDepth;
 uniform float uBaseline;
 uniform float uConv;
 uniform float uSwap;
-const float N = ${StereoRenderer.NUM_VIEWS}.0;
+const float N = ${numViews}.0;
 uniform float uGhost;
 uniform float uGhost2Lo; // post-filter pass strength below the brightness crossover
 uniform float uGhost2Hi; // ... and above it (no pedestal in either — blacks stay black)
@@ -474,6 +499,18 @@ void main() {
     }
     vec2 sv = vec2(u + coef * disp, vUv.y);
     vec3 own = texture(uFrame, sv).rgb;
+
+    // The crosstalk that ghosts is leakage from the ADJACENT panel view(s). At N=2 the only
+    // neighbour is the opposite eye (one step of 2.0 in coef space), identical to the old
+    // behaviour. At N>2 the neighbours are one 2/(N-1) step away on each side, so average the
+    // valid ones; edge views have a neighbour on one side only.
+    float stepC = 2.0 / max(N - 1.0, 1.0);
+    float cA = coef + stepC;
+    float cB = coef - stepC;
+    float wA = (cA <= 1.0001) ? 1.0 : 0.0;
+    float wB = (cB >= -1.0001) ? 1.0 : 0.0;
+    vec3 nbr = (wA * texture(uFrame, vec2(u + cA * disp, vUv.y)).rgb
+              + wB * texture(uFrame, vec2(u + cB * disp, vUv.y)).rgb) / max(wA + wB, 1.0);
     if (uGhMask > 0.001) {
         // Edge-aware ghost masking: only where BOTH local contrast and disparity are high
         // (exactly where crosstalk shows), blend toward a wider local average to soften the
@@ -495,9 +532,8 @@ void main() {
         // leak at the eye — but a bright ghost over black has nothing to subtract from.
         // Lifting blacks by p >= c (linear light) gives every pixel enough headroom to
         // cancel fully. Cost: blacks turn slightly grey as the slider rises.
-        vec3 other = texture(uFrame, vec2(u - coef * disp, vUv.y)).rgb;
         vec3 ol = pow(own, vec3(2.2));
-        vec3 tl = pow(other, vec3(2.2));
+        vec3 tl = pow(nbr, vec3(2.2));
         tl = mix(tl, vec3(dot(tl, LW)), uGhDesat);
         float p = min(uGhost, 0.25);               // pedestal: just enough headroom
         ol = p + ol * (1.0 - p);
@@ -547,8 +583,7 @@ void main() {
         float Lown = dot(own, LW);
         float c2 = mix(uGhost2Lo, uGhost2Hi, smoothstep(uGhost2X - 0.1, uGhost2X + 0.1, Lown));
         if (c2 > 0.001) {
-            vec3 other2 = texture(uFrame, vec2(u - coef * disp, vUv.y)).rgb;
-            vec3 t2 = pow(other2, vec3(2.2));
+            vec3 t2 = pow(nbr, vec3(2.2));
             t2 = mix(t2, vec3(dot(t2, LW)), uGhDesat);
             vec3 lin2 = (pow(own, vec3(2.2)) - c2 * t2) / (1.0 - c2);
             own = pow(clamp(lin2, 0.0, 1.0), vec3(1.0 / 2.2));

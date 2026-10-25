@@ -17,6 +17,9 @@ import android.widget.SeekBar
 import android.widget.TextView
 import com.lume3d.everywhere.Capture3DService
 import com.lume3d.everywhere.FILTER_NAMES
+import com.lume3d.everywhere.LeiaHack
+import com.lume3d.everywhere.centerViewX100
+import com.lume3d.everywhere.interlaceMode
 import com.lume3d.everywhere.actStrength
 import com.lume3d.everywhere.convergence
 import com.lume3d.everywhere.depthSharpOn
@@ -27,6 +30,7 @@ import com.lume3d.everywhere.edgePassMargin
 import com.lume3d.everywhere.filterAmt
 import com.lume3d.everywhere.ghostMaskOn
 import com.lume3d.everywhere.ghostMaskStrength
+import com.lume3d.everywhere.leiaNumViews
 import com.lume3d.everywhere.filterHi
 import com.lume3d.everywhere.filterLo
 import com.lume3d.everywhere.filterOn
@@ -83,9 +87,16 @@ class OverlayController(
     private var minimized = false
     private var tdPanelView: View? = null
     private var hideOverlayActive = false
+    private var syncHideBtn: (Boolean) -> Unit = {}
+
+    /** The service reports the user-Hide state (it can also change from the notification). */
     private var touchCatcher: View? = null
+    private var catcherWanted = true   // false while the 3D is hidden (see setChromeVisible)
     private var edgeMarginPx = 0
     private var passThroughAll = false
+    private var guiMode = false
+    private var guiInited = false
+    private var guiShown = false
     @Volatile var reconvergence = 0f
         set(v) { field = v; asset?.setReconvergenceAmount(v) }
 
@@ -144,6 +155,7 @@ class OverlayController(
             type, flags, PixelFormat.OPAQUE
         )
         lp.gravity = Gravity.TOP or Gravity.START
+        lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING   // keep lenticular geometry
         v.visibility = View.GONE
         removeWin(lastMainView); lastMainView = null
         wm.addView(v, lp)
@@ -171,7 +183,12 @@ class OverlayController(
         var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            // NOT_FOCUSABLE + ALT_FOCUSABLE_IM makes this window the IME's LAYERING target without
+            // ever taking focus: Android then parents the keyboard to its own layer above every app
+            // overlay, so Gboard (bound to the captured app's field on the VD) draws above the 3D
+            // instead of hidden behind it (DisplayContent.computeImeParent).
+            WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
         if (passThroughAll) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -180,6 +197,7 @@ class OverlayController(
             bounds.width() - 2 * m, bounds.height() - 2 * m, type, flags, PixelFormat.TRANSLUCENT)
         lp.gravity = Gravity.TOP or Gravity.START
         lp.x = m; lp.y = m
+        lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
         return lp
     }
 
@@ -189,6 +207,7 @@ class OverlayController(
         val cb = onTouch
         removeWin(touchCatcher); touchCatcher = null
         val catcher = View(context)
+        if (!catcherWanted) catcher.visibility = View.GONE   // rebuilt while 3D is hidden
         @Suppress("ClickableViewAccessibility")
         catcher.setOnTouchListener { _, ev ->
             // Catcher origin is inset by the margin; shift back into full-3D-view space, then map
@@ -197,7 +216,10 @@ class OverlayController(
             val m = (catcher.layoutParams as? WindowManager.LayoutParams)?.x ?: 0
             ev.offsetLocation(m.toFloat(), m.toFloat())
             val b = wm.maximumWindowMetrics.bounds
-            cb.invoke(ev, view?.width ?: b.width(), view?.height ?: b.height())
+            // In debug-GUI mode, touches drive CNSDK's built-in ImGui panel instead of being
+            // injected into the captured app (the panel is how we reach Interlace Mode).
+            if (guiMode) view?.onTouchEvent(ev)
+            else cb.invoke(ev, view?.width ?: b.width(), view?.height ?: b.height())
             true
         }
         removeWin(lastCatcherWin); lastCatcherWin = null
@@ -218,12 +240,16 @@ class OverlayController(
     /**
      * Rebuild the catcher via remove+add (changing FLAG_NOT_TOUCHABLE with updateViewLayout
      * leaves a stale input region, so the toggle silently did nothing). The fresh catcher lands
-     * on top, so we then lift the control bar (and visible input bar) back above it.
+     * on top, so we then lift the control bar and the input bar back above it.
+     *
+     * The input bar must be lifted even while it is GONE (which is nearly always): the system IME
+     * is layered just above that box, so if the catcher ends up above the box it also covers the
+     * keyboard and eats every key tap until the overlay is rebuilt from scratch.
      */
     private fun rebuildCatcher() {
         addTouchCatcher()
         bringToFront(tuneWin)
-        if (inputWin?.visibility == View.VISIBLE) bringToFront(inputWin)
+        bringToFront(inputWin)
     }
 
     /** Full pass-through: make the catcher ignore touch so every overlay app below gets it. */
@@ -249,11 +275,41 @@ class OverlayController(
      * transparent; edge pass-through only needs to dip just under the threshold. No-op unless the
      * user enabled the dim toggle.
      */
+    private var hidden3D = false
+
+    /**
+     * Hide or show the 3D without pausing CNSDK. Pausing it (view.onPause) and resuming later hands
+     * us a SurfaceTexture we cannot attach to again (eglCreateWindowSurface EGL_BAD_ALLOC, which
+     * crashed the app when returning from HOME/Recents). So the window just goes fully transparent
+     * (it is NOT_TOUCHABLE, and alpha 0 cannot obscure touches) and the 3D backlight goes off.
+     */
+    fun set3DHidden(hidden: Boolean) {
+        hidden3D = hidden
+        updateOverlayDim()
+        applyBacklight()
+    }
+
+    /**
+     * Flat 2D: the app stays on screen and touchable, just without depth. The 3D backlight goes
+     * off (so the panel looks like a normal screen) and the renderer feeds both eyes the same view.
+     */
+    private var flat2D = false
+    fun setFlat2D(on: Boolean) {
+        if (flat2D == on) return
+        flat2D = on
+        applyBacklight()
+        syncHideBtn(on)
+    }
+
+    private fun applyBacklight() {
+        try { leiaSDK?.enableBacklight(!hidden3D && !flat2D) } catch (_: Throwable) {}
+    }
+
     fun updateOverlayDim() {
         val lp = rootLp ?: return
         val v = view ?: return
         val dimA = (context.passThroughDimPct.coerceIn(10, 79)) / 100f
-        val alpha = if (!context.dimForPassThrough) 1f else when {
+        val alpha = if (hidden3D) 0f else if (!context.dimForPassThrough) 1f else when {
             passThroughAll -> dimA        // user-set opacity (10..79%)
             edgeMarginPx > 0 -> dimA
             else -> 1f
@@ -343,13 +399,14 @@ class OverlayController(
                 visibility = View.GONE
             }
 
-            val hideBtn = mkPanelBtn("👁  Hide Overlay")
+            val hideBtn = mkPanelBtn("👁  Show in 2D")
+            syncHideBtn = { flat ->
+                hideOverlayActive = flat
+                hideBtn.text = if (flat) "👁  Show in 3D" else "👁  Show in 2D"
+                hideBtn.setBackgroundColor(if (flat) 0xFF442200.toInt() else 0xFF2A2A2A.toInt())
+            }
             hideBtn.setOnClickListener {
-                hideOverlayActive = !hideOverlayActive
-                Capture3DService.active?.setOverlayVisible(!hideOverlayActive)
-                hideBtn.text = if (hideOverlayActive) "👁  Show Overlay" else "👁  Hide Overlay"
-                hideBtn.setBackgroundColor(
-                    if (hideOverlayActive) 0xFF442200.toInt() else 0xFF2A2A2A.toInt())
+                Capture3DService.active?.setFlat2D(!hideOverlayActive)   // the service syncs us back
             }
 
             val divider1 = View(context).apply { setBackgroundColor(0xFF333333.toInt()) }
@@ -473,7 +530,19 @@ class OverlayController(
                 }
             })
 
+            // CNSDK debug panel: the only way to reach Interlace Mode (View Peeling experiment).
+            // While it's up, touches drive the panel instead of the captured app.
+            val guiBtn = mkPanelBtn("🛠  CNSDK Debug Panel")
+            guiBtn.setOnClickListener {
+                val on = !(Capture3DService.active?.isDebugGui() ?: false)
+                Capture3DService.active?.setDebugGui(on)
+                guiBtn.text = if (on) "🛠  Debug Panel ON (tap to exit)" else "🛠  CNSDK Debug Panel"
+                guiBtn.setBackgroundColor(if (on) 0xFF224422.toInt() else 0xFF2A2A2A.toInt())
+                if (on) ctrlPanel?.visibility = View.GONE   // get our menu out of the way
+            }
+
             settingsPanel.addView(hideBtn, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT))
+            settingsPanel.addView(guiBtn, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
             settingsPanel.addView(passBtn, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
             settingsPanel.addView(edgeLabel)
             settingsPanel.addView(edgeSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -488,6 +557,47 @@ class OverlayController(
             settingsPanel.addView(convSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
             settingsPanel.addView(actLabel)
             settingsPanel.addView(actSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+            // Center View: where the interlacer puts the L/R seam relative to your face. The
+            // single most direct lever on the double-image (a mis-placed seam makes every eye
+            // straddle it). Factory 2.64 on this panel; 2.24 measured better. 0.00..5.00.
+            val cvLabel = android.widget.TextView(context).apply {
+                setTextColor(0xFFD8DCE6.toInt()); textSize = 13f
+                val mt = dp(8); setPadding(0, mt, 0, 0)
+            }
+            fun syncCv() { cvLabel.text = "Center View (seam position): %.2f".format(context.centerViewX100 / 100f) }
+            syncCv()
+            val cvSeek = SeekBar(context).apply { max = 500; progress = context.centerViewX100 }
+            cvSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    context.centerViewX100 = p; syncCv()
+                    Capture3DService.active?.setCenterView(p / 100f)
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+            settingsPanel.addView(cvLabel)
+            settingsPanel.addView(cvSeek, LinearLayout.LayoutParams(seekW, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+            // EXPERIMENTAL: View Peeling. Switches the native interlacer from Stereo Sliding (2
+            // source views + hard L/R seam) to true N-view, and feeds it one atlas tile per
+            // hardware view. Needs a restart of 3D because the atlas size is fixed at creation.
+            val vpBtn = mkPanelBtn("")
+            fun syncVp() {
+                val on = context.interlaceMode == 0
+                vpBtn.text = if (on) "🧪  View Peeling: ON (restart 3D)" else "🧪  Try View Peeling (experimental)"
+                vpBtn.setBackgroundColor(if (on) 0xFF224422.toInt() else 0xFF2A2A2A.toInt())
+            }
+            syncVp()
+            vpBtn.setOnClickListener {
+                val on = context.interlaceMode != 0
+                context.interlaceMode = if (on) 0 else -1
+                // View Peeling wants one tile per hardware view; Stereo Sliding wants exactly 2.
+                context.leiaNumViews = if (on) 8 else 2
+                syncVp()
+                Log.i(TAG, "view peeling -> $on (interlaceMode=${context.interlaceMode}, tiles=${context.leiaNumViews})")
+            }
+            settingsPanel.addView(vpBtn, LinearLayout.LayoutParams(panelW, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
 
             // ── band-limited visual filters (parametric-EQ style: amount + luminance band) ──
             settingsPanel.addView(View(context).apply { setBackgroundColor(0xFF333333.toInt()) },
@@ -905,7 +1015,39 @@ class OverlayController(
 
     private val kbHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
+    /**
+     * ⌨ button: close the keyboard if it is up, otherwise open it. The IME is bound to the
+     * captured app's field on the virtual display, which our app can't see, so ask the system
+     * (`dumpsys input_method` via Shizuku) whether it is showing. Off the main thread: it's a shell
+     * round-trip.
+     */
     private fun toggleKeyboard() {
+        Thread {
+            val shown = com.lume3d.everywhere.privileged.Privileged.isImeShown()
+            Log.i(TAG, "keyboard button: imeShown=$shown")
+            // Close = one BACK sent only to the virtual display. While the IME is up, the IME
+            // consumes that BACK and hides itself; the captured app does not navigate (verified on
+            // the LP2: mInputShown -> false, same resumed activity). Done right after the check to
+            // keep the window where the IME could vanish on its own (and BACK would then go back
+            // in the app) as small as possible.
+            if (shown) Capture3DService.active?.sendBackToApp()
+            else kbHandler.post { openKeyboard() }
+        }.start()
+    }
+
+    private fun openKeyboard() {
+        // The catcher is the IME's layering target, so the keyboard draws above the 3D by itself:
+        // just re-tap the last text field in the app. If the keyboard still isn't up after a beat
+        // (no field tapped yet, or a ROM where the layering trick fails), use the old box relay.
+        Capture3DService.active?.summonKeyboard()
+        Thread {
+            try { Thread.sleep(900) } catch (_: InterruptedException) { return@Thread }
+            if (com.lume3d.everywhere.privileged.Privileged.isImeShown()) Log.i(TAG, "keyboard up via direct tap")
+            else kbHandler.post { openKeyboardViaBox() }
+        }.start()
+    }
+
+    private fun openKeyboardViaBox() {
         // Pop a momentary FOCUSABLE box from OUR app so the IME draws above the 3D overlay, then
         // immediately hand focus back to the captured app's field (re-tap on the virtual display)
         // and remove our box — WITHOUT hiding the soft input. The keyboard stays up, now rebound to
@@ -1037,8 +1179,76 @@ class OverlayController(
         }
     }
 
+    /**
+     * Apply the user-selected interlace mode (View Peeling etc.) if one is set.
+     *
+     * Must run on the GL thread. The native SetInterlaceMode throws (and would abort the process)
+     * if called from elsewhere, so we go through InterlacedSurfaceView.queueEvent. Delayed a beat
+     * so the interlacer is fully constructed before we poke its vtable.
+     */
+    fun applyInterlaceMode() {
+        val mode = context.interlaceMode
+        if (mode < 0) return                      // -1 = leave the SDK default alone
+        val v = view ?: return
+        kbHandler.postDelayed({
+            try {
+                v.queueEvent {
+                    val ok = LeiaHack.setInterlaceMode(v, mode)
+                    Log.i(TAG, "interlaceMode=$mode applied=$ok")
+                }
+            } catch (t: Throwable) { Log.e(TAG, "applyInterlaceMode failed: ${t.message}") }
+        }, 1500)
+    }
+
+    /**
+     * Set Config.centerViewNumber: where the interlacer puts the left/right view boundary
+     * relative to the tracked face. Miscalibration here makes each eye straddle the seam, which
+     * is a real double-image source (2.24 measured better than the 2.64 factory value).
+     * Unlike act_beta (accepted-but-ignored), this one drives the per-pixel view index directly.
+     */
+    fun setCenterView(v: Float) {
+        val sdk = leiaSDK ?: try { LeiaSDK.getInstance() } catch (_: Throwable) { null } ?: return
+        try {
+            val cfg = sdk.config ?: return
+            cfg.centerViewNumber = v
+            sdk.setConfig(cfg)
+            Log.i(TAG, "centerViewNumber -> $v (readback=${sdk.config?.centerViewNumber})")
+        } catch (t: Throwable) { Log.e(TAG, "setCenterView failed: ${t.message}") }
+    }
+
+    /**
+     * Show/hide CNSDK's built-in ImGui debug panel and route touches to it.
+     *
+     * This is the only Java-reachable way to reach `Interlace Mode` (View Peeling / View Sliding /
+     * Stereo Sliding). The native `SetInterlaceMode` has no JNI export; the panel's buttons call
+     * it internally on the interlacer's own thread, which also satisfies its thread check. The
+     * panel additionally prints the real "Number of HW/SW Views", confirming the view geometry.
+     *
+     * `toggleGui()` initialises the GUI (first call only); `toggleGuiVisibility()` shows/hides it.
+     * Both are queued to the GL thread by the SDK.
+     */
+    fun setDebugGui(on: Boolean) {
+        val v = view ?: return
+        try {
+            // toggleGui() BOTH initialises AND shows the panel. Blindly calling
+            // toggleGuiVisibility() after it cancelled the show, leaving the panel hidden while
+            // guiMode said "on" (so touches still went to the captured app). Track the real
+            // shown-state and only toggle when it differs from what was asked for.
+            if (!guiInited) { v.toggleGui(); guiInited = true; guiShown = true }
+            if (guiShown != on) { v.toggleGuiVisibility(); guiShown = !guiShown }
+            guiMode = guiShown
+            Log.i(TAG, "debug GUI shown=$guiShown (touch -> ${if (guiMode) "ImGui" else "captured app"})")
+        } catch (t: Throwable) {
+            Log.e(TAG, "setDebugGui failed: ${t.message}")
+        }
+    }
+    fun isDebugGui() = guiMode
+
     /** 2D single-view (portrait fallback) vs full lightfield 3D (landscape). */
+    private var singleView: Boolean? = null
     fun setSingleView(on: Boolean) {
+        if (singleView == on) return
+        singleView = on
         try { view?.setSingleViewMode(on); Log.i(TAG, "singleViewMode=$on") }
         catch (t: Throwable) { Log.e(TAG, "setSingleView failed: ${t.message}") }
     }
@@ -1049,6 +1259,21 @@ class OverlayController(
 
     fun hide() {
         view?.let { if (it.visibility != View.GONE) { it.onPause(); it.visibility = View.GONE; Log.i(TAG, "overlay HIDE") } }
+        // Whatever is revealed (launcher, other apps) is flat 2D: the 3D backlight would only blur it.
+        try { leiaSDK?.enableBacklight(false) } catch (_: Throwable) {}
+    }
+
+    /**
+     * Show or hide our other windows along with the 3D. The touch catcher must go when the 3D does,
+     * or it keeps eating taps meant for the launcher/app underneath and sends them to the hidden
+     * app. The control bar stays for a user Hide (its Show button) and goes otherwise, so it does
+     * not float over the home screen or other apps.
+     */
+    fun setChromeVisible(controls: Boolean, catcher: Boolean) {
+        tuneWin?.visibility = if (controls) View.VISIBLE else View.GONE
+        catcherWanted = catcher
+        touchCatcher?.visibility = if (catcher) View.VISIBLE else View.GONE
+        if (!controls) inputWin?.visibility = View.GONE
     }
 
     /** Remove a window; fall back to immediate removal so rotation teardown can't leak it. */
@@ -1077,7 +1302,19 @@ class OverlayController(
     override fun didInitialize(sdk: LeiaSDK) {
         Log.i(TAG, "LeiaSDK initialized; enabling 3D backlight")
         this.leiaSDK = sdk
-        sdk.enableBacklight(true)
+        sdk.enableBacklight(!hidden3D && !flat2D)
+        setCenterView(context.centerViewX100 / 100f)   // seam placement (see setCenterView)
+        applyInterlaceMode()                           // View Peeling etc., if the user selected one
+        // Log the panel config for reference. NOTE: we deliberately do NOT drive the atlas tile
+        // count from numViews: in Stereo Sliding mode the hardware views steer a 2-view pair
+        // rather than carrying 8 perspectives (see Prefs.leiaNumViews).
+        try {
+            val cfg = sdk.config
+            Log.i(TAG, "Leia Config: numViews=${cfg?.numViews?.x}x${cfg?.numViews?.y}, " +
+                "panel=${cfg?.panelResolution?.x}x${cfg?.panelResolution?.y}, " +
+                "viewRes=${cfg?.viewResolution?.x}x${cfg?.viewResolution?.y}, " +
+                "atlasTiles=${context.leiaNumViews}")
+        } catch (t: Throwable) { Log.w(TAG, "config read failed: ${t.message}") }
         // Note: Config.act_beta writes are accepted but ignored by the interlacer (tested
         // 2026-07-27, even across full SDK reinit) — ghost reduction is instead done by
         // crosstalk pre-compensation in our own DIBR shader (StereoRenderer.ghost).

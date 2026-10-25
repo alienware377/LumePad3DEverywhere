@@ -61,6 +61,35 @@ var Context.ghostDesatStrength: Int
     get() = prefs().getInt("ghost_desat", 0)
     set(v) { prefs().edit().putInt("ghost_desat", v).apply() }
 
+/**
+ * Atlas tile count. MUST be 2 while the interlacer runs in Stereo Sliding mode (interlaceMode=2,
+ * the boot default): there, the 8 hardware views are a STEERING mechanism, not 8 perspectives;
+ * face tracking slides a 4-views-left / 4-views-right boundary so each eye's cone (~4 hw views)
+ * sees ONE consistent image. Giving each hw view a distinct perspective (tested 2026-07-27 with a
+ * patched interlace.pshader tiling by hardwareViewsX) makes each eye see ~4 different perspectives
+ * at once => a multi-copy SMEAR, worse than the original single ghost. True N-view needs
+ * interlaceMode=0 (View Peeling), which has no JNI setter. See the skill file.
+ */
+var Context.leiaNumViews: Int
+    get() = prefs().getInt("leia_num_views", 2).coerceIn(2, 12)
+    set(v) { prefs().edit().putInt("leia_num_views", v).apply() }
+
+/**
+ * Leia Config.centerViewNumber x100 (so 224 == 2.24). This is where the interlacer places the
+ * left/right view boundary relative to your face; if it's off, each eye permanently straddles
+ * the seam and picks up the opposite image: a persistent double-image no amount of shader-side
+ * pre-compensation truly removes. Factory value on this panel is 2.64; 2.24 measured better.
+ */
+var Context.centerViewX100: Int
+    get() = prefs().getInt("center_view_x100", 224)
+    set(v) { prefs().edit().putInt("center_view_x100", v).apply() }
+
+/** Interlace mode: 0 = View Peeling (true N-view), 1 = View Sliding, 2 = Stereo Sliding
+ *  (the SDK default). Applied via a native vtable call; -1 = leave alone. */
+var Context.interlaceMode: Int
+    get() = prefs().getInt("interlace_mode", -1)
+    set(v) { prefs().edit().putInt("interlace_mode", v).apply() }
+
 /** Edge pass-through margin (px). Gestures starting within this frame of the screen edge
  *  fall through to overlay apps below us (Pie Control triggers, etc.). 0 = disabled. */
 var Context.edgePassMargin: Int

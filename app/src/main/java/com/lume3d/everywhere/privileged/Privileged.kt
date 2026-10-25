@@ -127,7 +127,7 @@ object Privileged {
      * Launch [pkg]'s launcher activity onto [displayId] via `am start` as shell.
      *
      * FLAG_OWN_CONTENT_ONLY untrusted virtual displays only render tasks that were
-     * launched directly onto them — migrated tasks (via `am stack move-task`) attach
+     * launched directly onto them; migrated tasks (via `am stack move-task`) attach
      * but produce a black surface. So on initial service start we always force-stop
      * + fresh-launch to guarantee a visible capture. The Hide/Show overlay toggle
      * uses [migrateToDisplay] instead, which preserves state for that scope.
@@ -154,7 +154,7 @@ object Privileged {
      * Scan `am stack list` (or its newer `am task list`) output for a task owned by [pkg].
      * Returns the first matching task id, or -1 if none found.
      */
-    private fun findTaskIdForPkg(pkg: String): Int = try {
+    fun findTaskIdForPkg(pkg: String): Int = try {
         val out = runShellCapture(arrayOf("am", "stack", "list")).ifBlank {
             runShellCapture(arrayOf("am", "task", "list"))
         }
@@ -167,17 +167,15 @@ object Privileged {
     fun moveBackToDefault(pkg: String): Boolean = migrateToDisplay(pkg, 0)
 
     /** Move (or, if absent, fresh-launch) [pkg]'s task onto [displayId] without killing
-     *  the process — used by the Hide/Show toggle to swap between 2D on display 0 and
+     *  the process. Used by the Hide/Show toggle to swap between 2D on display 0 and
      *  3D on the virtual display while preserving the activity's in-memory state. */
     fun migrateToDisplay(pkg: String, displayId: Int): Boolean {
         return try {
             val taskId = findTaskIdForPkg(pkg)
-            if (taskId >= 0) {
-                val rc = runShell(arrayOf("am", "stack", "move-task",
-                    taskId.toString(), displayId.toString(), "true"))
-                Log.i(TAG, "migrate move-task $taskId -> display $displayId rc=$rc")
-                if (rc == 0) return true
-            }
+            // `am stack move-task` takes a ROOT TASK id and a root-task POSITION, not a display, so
+            // it never did what this needed. `am display move-stack <rootTaskId> <displayId>` is the
+            // real cross-display move (for a single-task app the root task id == the task id).
+            if (taskId >= 0 && moveTaskToDisplay(taskId, displayId)) return true
             val cmp = resolveLauncher(pkg) ?: pkg
             runShell(arrayOf("am", "start", "--display", displayId.toString(),
                 "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER",
@@ -237,7 +235,7 @@ object Privileged {
     fun injectMotion(event: MotionEvent, displayId: Int): Boolean {
         return try {
             ensureInput()
-            // event.setDisplayId(displayId) — hidden.
+            // event.setDisplayId(displayId) is hidden.
             MotionEvent::class.java.getMethod("setDisplayId", Int::class.javaPrimitiveType)
                 .invoke(event, displayId)
             val im = shellInput!!
@@ -283,6 +281,89 @@ object Privileged {
      *  - block_untrusted_touches_mode = 0 (DeviceConfig): disables the block feature outright.
      * Both are shell-scoped and applied live via the InputManager settings/DeviceConfig observers.
      */
+    /**
+     * Is the system keyboard showing right now? The IME is bound to the captured app on the
+     * virtual display, so our app gets no callbacks for it; `dumpsys input_method` reports
+     * `mInputShown=true` while it is up (verified on the LP2).
+     */
+    /** Close the notification shade (after a notification button that acts on the 3D app). */
+    fun collapseShade(): Boolean = try { runShell(arrayOf("cmd", "statusbar", "collapse")) == 0 }
+        catch (t: Throwable) { Log.w(TAG, "collapseShade failed: ${t.message}"); false }
+
+    /** Move a (root) task to another display, keeping the app's process and state. */
+    fun moveTaskToDisplay(taskId: Int, displayId: Int): Boolean = try {
+        val rc = runShell(arrayOf("am", "display", "move-stack", taskId.toString(), displayId.toString()))
+        Log.i(TAG, "move-stack $taskId -> display $displayId rc=$rc")
+        rc == 0
+    } catch (t: Throwable) { Log.w(TAG, "moveTaskToDisplay failed: ${t.message}"); false }
+
+    /**
+     * Register [listener] (a [TaskEvents] binder) for the system's task events, as shell. The
+     * framework calls our binder directly, the same way our virtual-display callback already works.
+     * Needs MANAGE_ACTIVITY_TASKS, which shell holds.
+     */
+    fun registerTaskEvents(listener: TaskEvents, register: Boolean = true): Boolean = try {
+        ensureBypass()
+        val atmStub = Class.forName("android.app.IActivityTaskManager\$Stub")
+        val atm = atmStub.getMethod("asInterface", IBinder::class.java)
+            .invoke(null, ShizukuBinderWrapper(getService("activity_task")))
+        val iface = Class.forName("android.app.ITaskStackListener")
+        val name = if (register) "registerTaskStackListener" else "unregisterTaskStackListener"
+        atm!!.javaClass.getMethod(name, iface).invoke(atm, binderAs(iface, listener, "TaskEvents"))
+        Log.i(TAG, "$name ok")
+        true
+    } catch (t: Throwable) { Log.w(TAG, "task listener (register=$register) failed: ${t.cause ?: t}"); false }
+
+    /** Install (or with null, remove) the system-wide activity-start watcher. See [LaunchGuard]. */
+    fun setActivityController(guard: LaunchGuard?): Boolean = try {
+        ensureBypass()
+        val amStub = Class.forName("android.app.IActivityManager\$Stub")
+        val am = amStub.getMethod("asInterface", IBinder::class.java)
+            .invoke(null, ShizukuBinderWrapper(getService("activity")))
+        val iface = Class.forName("android.app.IActivityController")
+        am!!.javaClass.getMethod("setActivityController", iface, Boolean::class.javaPrimitiveType)
+            .invoke(am, guard?.let { binderAs(iface, it, "LaunchGuard") }, false)
+        Log.i(TAG, "activity controller ${if (guard != null) "set" else "cleared"}")
+        true
+    } catch (t: Throwable) { Log.w(TAG, "setActivityController failed: ${t.cause ?: t}"); false }
+
+    /**
+     * A dynamic proxy standing in for a hidden AIDL interface; the only thing the framework's
+     * proxy asks it for is asBinder(), which hands over our real Binder.
+     */
+    private fun binderAs(iface: Class<*>, binder: IBinder, label: String): Any =
+        java.lang.reflect.Proxy.newProxyInstance(iface.classLoader, arrayOf(iface)) { self, m, args ->
+            when (m.name) {
+                "asBinder" -> binder
+                "hashCode" -> System.identityHashCode(binder)
+                "equals" -> self === args?.getOrNull(0)
+                "toString" -> label
+                else -> null
+            }
+        }
+
+    /** Does [displayId] currently have a resumed activity? (Used to notice the app backing out.) */
+    fun hasResumedActivityOnDisplay(displayId: Int): Boolean = try {
+        val out = runShellCapture(arrayOf("dumpsys", "activity", "activities"))
+        val start = out.indexOf("Display #$displayId (")
+        if (start < 0) false else {
+            val next = out.indexOf("Display #", start + 1).let { if (it < 0) out.length else it }
+            out.substring(start, next).contains("mResumedActivity:")
+        }
+    } catch (t: Throwable) { Log.w(TAG, "hasResumedActivityOnDisplay failed: ${t.message}"); true }
+
+    /** Bring [pkg]'s existing task to the front of [displayId] (no force-stop: state is kept). */
+    fun bringToFrontOnDisplay(pkg: String, displayId: Int): Boolean = try {
+        val cmp = resolveLauncher(pkg) ?: pkg
+        runShell(arrayOf("am", "start", "--display", displayId.toString(),
+            "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER",
+            "-n", cmp, "-f", "0x10200000")) == 0   // NEW_TASK | RESET_TASK_IF_NEEDED
+    } catch (t: Throwable) { Log.w(TAG, "bringToFrontOnDisplay failed: ${t.message}"); false }
+
+    fun isImeShown(): Boolean = try {
+        runShellCapture(arrayOf("dumpsys", "input_method")).contains("mInputShown=true")
+    } catch (t: Throwable) { Log.w(TAG, "isImeShown failed: ${t.message}"); false }
+
     fun allowTouchThroughOverlay(): Boolean = try {
         val a = runShell(arrayOf("settings", "put", "global",
             "maximum_obscuring_opacity_for_touch", "1.0"))

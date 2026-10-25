@@ -11,8 +11,8 @@ android {
         applicationId = "com.lume3d.everywhere"
         minSdk = 30          // CNSDK requires >= 30; Lume Pad 2 ships Android 13 (API 33)
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "1.1.0"
 
         // CNSDK native libs ship arm64-v8a only (Lume Pad 2 is arm64).
         ndk { abiFilters += "arm64-v8a" }
@@ -22,6 +22,14 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+
+    // Tiny C shim used to reach CNSDK's non-exported SetInterlaceMode (see cpp/leiahack.c).
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 
